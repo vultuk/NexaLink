@@ -1,6 +1,6 @@
 //
 //  ContentView.swift
-//  schema-agent
+//  NexaLink
 //
 //  Created by Simon Skinner on 21/02/2026.
 //
@@ -118,6 +118,8 @@ final class AppServerConnection: ObservableObject {
     private var currentCandidateIndex = 0
     private var didReceiveInitializeResponse = false
     private var receiveBuffer = Data()
+    private var fragmentedMessageOpcode: UInt8?
+    private var fragmentedMessageBuffer = Data()
     private var activeHandshakeKey: String?
     private var isUserInitiatedDisconnect = false
     private var phase: SocketPhase = .idle
@@ -128,7 +130,15 @@ final class AppServerConnection: ObservableObject {
     private var passiveThreadResumeRequestIDs: Set<Int> = []
     private var turnStartContextsByRequestID: [Int: PendingTurnStartContext] = [:]
     private var threadReadThreadIDByRequestID: [Int: String] = [:]
+    private var threadReadSummaryRequestIDs: Set<Int> = []
+    private var threadListRequestContextsByRequestID: [Int: PendingThreadListContext] = [:]
+    private var threadListAccumulator: [AppThread] = []
+    private var threadListRetryCount = 0
+    private let maxThreadListPagesPerRefresh = 0
+    private let threadListPageSize = 50
+    private var threadArchiveThreadIDByRequestID: [Int: String] = [:]
     private var threadCreateCompletionsByRequestID: [Int: (_ threadID: String?, _ errorMessage: String?) -> Void] = [:]
+    private var threadArchiveCompletionsByRequestID: [Int: (_ success: Bool, _ errorMessage: String?) -> Void] = [:]
     private var commandExecCompletionsByRequestID: [Int: (_ result: [String: Any]?, _ errorMessage: String?) -> Void] = [:]
     private var currentThreadID: String?
     private var assistantEntryIDByItemID: [String: UUID] = [:]
@@ -155,6 +165,15 @@ final class AppServerConnection: ObservableObject {
         let threadID: String
     }
 
+    private struct PendingThreadListContext {
+        let replace: Bool
+        let cursor: String?
+        let page: Int
+        let includeSortKey: Bool
+        let includeAllSourceKinds: Bool
+        let minimalParams: Bool
+    }
+
     func connect() {
         guard let url = normalizedWebSocketURL(from: serverURLString) else {
             state = .failed
@@ -176,12 +195,20 @@ final class AppServerConnection: ObservableObject {
             self.queuedMessages.removeAll()
             self.didReceiveInitializeResponse = false
             self.receiveBuffer.removeAll()
+            self.fragmentedMessageOpcode = nil
+            self.fragmentedMessageBuffer.removeAll()
             self.threadStartPromptsByRequestID.removeAll()
             self.threadResumePromptsByRequestID.removeAll()
             self.passiveThreadResumeRequestIDs.removeAll()
             self.turnStartContextsByRequestID.removeAll()
             self.threadReadThreadIDByRequestID.removeAll()
+            self.threadReadSummaryRequestIDs.removeAll()
+            self.threadListRequestContextsByRequestID.removeAll()
+            self.threadListAccumulator.removeAll()
+            self.threadListRetryCount = 0
+            self.threadArchiveThreadIDByRequestID.removeAll()
             self.threadCreateCompletionsByRequestID.removeAll()
+            self.threadArchiveCompletionsByRequestID.removeAll()
             self.commandExecCompletionsByRequestID.removeAll()
             self.assistantEntryIDByItemID.removeAll()
             self.modelListAccumulator.removeAll()
@@ -204,12 +231,20 @@ final class AppServerConnection: ObservableObject {
             self.pendingRequests.removeAll()
             self.queuedMessages.removeAll()
             self.didReceiveInitializeResponse = false
+            self.fragmentedMessageOpcode = nil
+            self.fragmentedMessageBuffer.removeAll()
             self.threadStartPromptsByRequestID.removeAll()
             self.threadResumePromptsByRequestID.removeAll()
             self.passiveThreadResumeRequestIDs.removeAll()
             self.turnStartContextsByRequestID.removeAll()
             self.threadReadThreadIDByRequestID.removeAll()
+            self.threadReadSummaryRequestIDs.removeAll()
+            self.threadListRequestContextsByRequestID.removeAll()
+            self.threadListAccumulator.removeAll()
+            self.threadListRetryCount = 0
+            self.threadArchiveThreadIDByRequestID.removeAll()
             self.threadCreateCompletionsByRequestID.removeAll()
+            self.threadArchiveCompletionsByRequestID.removeAll()
             self.commandExecCompletionsByRequestID.removeAll()
             self.assistantEntryIDByItemID.removeAll()
             self.modelListAccumulator.removeAll()
@@ -323,6 +358,41 @@ final class AppServerConnection: ObservableObject {
             self.threadCreateCompletionsByRequestID[requestID] = completion
             DispatchQueue.main.async {
                 self.statusMessage = "Creating thread..."
+            }
+        }
+    }
+
+    func refreshThreadList() {
+        connectionQueue.async {
+            guard self.didReceiveInitializeResponse, self.phaseIsOpenLocked() else { return }
+            self.requestThreadListLocked(replace: true, cursor: nil, includeSortKey: false)
+        }
+    }
+
+    func archiveThread(
+        threadID: String,
+        completion: @escaping (_ success: Bool, _ errorMessage: String?) -> Void
+    ) {
+        guard state == .connected else {
+            completion(false, "Connection is not ready.")
+            return
+        }
+
+        let trimmedThreadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedThreadID.isEmpty else {
+            completion(false, "Thread ID is missing.")
+            return
+        }
+
+        connectionQueue.async {
+            let requestID = self.sendRequestLocked(
+                method: "thread/archive",
+                params: ["threadId": trimmedThreadID]
+            )
+            self.threadArchiveThreadIDByRequestID[requestID] = trimmedThreadID
+            self.threadArchiveCompletionsByRequestID[requestID] = completion
+            DispatchQueue.main.async {
+                self.statusMessage = "Archiving thread..."
             }
         }
     }
@@ -444,13 +514,13 @@ final class AppServerConnection: ObservableObject {
         return components.url
     }
 
-    private func sendInitializeRequest() {
-        sendRequest(
+    private func sendInitializeRequestLocked() {
+        _ = sendRequestLocked(
             method: "initialize",
             params: [
                 "clientInfo": [
-                    "name": "schema-agent",
-                    "title": "Schema Agent",
+                    "name": "NexaLink",
+                    "title": "NexaLink",
                     "version": "0.1.0"
                 ]
             ]
@@ -458,25 +528,41 @@ final class AppServerConnection: ObservableObject {
     }
 
     private func handleIncomingText(_ text: String) {
-        guard let data = text.data(using: .utf8) else { return }
-        handleIncomingData(data)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        var handled = false
+        if let data = trimmed.data(using: .utf8) {
+            handled = handleIncomingData(data)
+        }
+        if handled { return }
+
+        for line in text.split(whereSeparator: \.isNewline) {
+            let lineText = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !lineText.isEmpty, let lineData = lineText.data(using: .utf8) else { continue }
+            _ = handleIncomingData(lineData)
+        }
     }
 
-    private func handleIncomingData(_ data: Data) {
+    @discardableResult
+    private func handleIncomingData(_ data: Data) -> Bool {
         guard
             let object = try? JSONSerialization.jsonObject(with: data),
             let payload = object as? [String: Any]
-        else { return }
+        else { return false }
 
         if let method = payload["method"] as? String {
             let params = payload["params"] as? [String: Any] ?? payload
             handleNotification(method: method, params: params)
-            return
+            return true
         }
 
         if let id = parseRequestID(payload["id"]) {
             handleResponse(id: id, payload: payload)
+            return true
         }
+
+        return false
     }
 
     private func handleResponse(id: Int, payload: [String: Any]) {
@@ -484,6 +570,7 @@ final class AppServerConnection: ObservableObject {
 
         if let error = payload["error"] as? [String: Any] {
             let message = (error["message"] as? String) ?? "Unknown server error"
+            var shouldSkipGenericFailureStatus = false
             if method == "thread/start" {
                 threadStartPromptsByRequestID.removeValue(forKey: id)
                 if let completion = threadCreateCompletionsByRequestID.removeValue(forKey: id) {
@@ -508,6 +595,43 @@ final class AppServerConnection: ObservableObject {
                 }
             } else if method == "thread/read" {
                 threadReadThreadIDByRequestID.removeValue(forKey: id)
+                threadReadSummaryRequestIDs.remove(id)
+            } else if method == "thread/list" {
+                if let context = threadListRequestContextsByRequestID.removeValue(forKey: id) {
+                    if context.cursor != nil && !threadListAccumulator.isEmpty {
+                        let fallbackThreads = threadListAccumulator.sorted { $0.updatedAt > $1.updatedAt }
+                        threadListAccumulator.removeAll()
+                        DispatchQueue.main.async {
+                            self.threads = fallbackThreads
+                        }
+                        shouldSkipGenericFailureStatus = true
+                    } else if context.cursor == nil && threadListRetryCount < 2 {
+                        threadListRetryCount += 1
+                        let retryDelay: TimeInterval = threadListRetryCount == 1 ? 0.6 : 1.2
+                        let useMinimalRetry = threadListRetryCount == 1
+                        let retryIncludeAllSources = !useMinimalRetry
+                        let retryIncludeSortKey = !useMinimalRetry
+                        connectionQueue.asyncAfter(deadline: .now() + retryDelay) { [weak self] in
+                            guard let self else { return }
+                            guard self.didReceiveInitializeResponse, self.phaseIsOpenLocked() else { return }
+                            self.requestThreadListLocked(
+                                replace: true,
+                                cursor: nil,
+                                includeSortKey: retryIncludeSortKey,
+                                includeAllSourceKinds: retryIncludeAllSources,
+                                minimalParams: useMinimalRetry
+                            )
+                        }
+                        shouldSkipGenericFailureStatus = true
+                    }
+                }
+            } else if method == "thread/archive" {
+                threadArchiveThreadIDByRequestID.removeValue(forKey: id)
+                if let completion = threadArchiveCompletionsByRequestID.removeValue(forKey: id) {
+                    DispatchQueue.main.async {
+                        completion(false, message)
+                    }
+                }
             } else if method == "model/list" {
                 modelListAccumulator.removeAll()
             } else if method == "command/exec" {
@@ -516,6 +640,9 @@ final class AppServerConnection: ObservableObject {
                         completion(nil, message)
                     }
                 }
+            }
+            if shouldSkipGenericFailureStatus {
+                return
             }
             DispatchQueue.main.async {
                 if method == "initialize" {
@@ -533,14 +660,14 @@ final class AppServerConnection: ObservableObject {
 
         if method == "initialize" {
             let userAgent = ((payload["result"] as? [String: Any])?["userAgent"] as? String) ?? "unknown server"
+            didReceiveInitializeResponse = true
             DispatchQueue.main.async {
-                self.didReceiveInitializeResponse = true
                 self.state = .connected
                 self.statusMessage = "Connected (raw WS, \(userAgent))"
-                self.sendNotification(method: "initialized", params: [:])
             }
-            sendRequest(method: "thread/list", params: ["limit": 50, "sortKey": "updated_at"])
-            sendRequest(method: "model/list", params: ["limit": 100, "includeHidden": false])
+            sendNotificationLocked(method: "initialized", params: [:])
+            requestThreadListLocked(replace: true, cursor: nil, includeSortKey: false, includeAllSourceKinds: false)
+            _ = sendRequestLocked(method: "model/list", params: ["limit": 100, "includeHidden": false])
         } else if method == "thread/start" {
             handleThreadStartResponse(id: id, payload: payload)
         } else if method == "thread/resume" {
@@ -548,9 +675,11 @@ final class AppServerConnection: ObservableObject {
         } else if method == "turn/start" {
             handleTurnStartResponse(id: id, payload: payload)
         } else if method == "thread/list" {
-            handleThreadListResponse(payload: payload)
+            handleThreadListResponse(id: id, payload: payload)
         } else if method == "thread/read" {
             handleThreadReadResponse(id: id, payload: payload)
+        } else if method == "thread/archive" {
+            handleThreadArchiveResponse(id: id)
         } else if method == "model/list" {
             handleModelListResponse(payload: payload)
         } else if method == "command/exec" {
@@ -669,25 +798,107 @@ final class AppServerConnection: ObservableObject {
         }
     }
 
-    private func handleThreadListResponse(payload: [String: Any]) {
-        guard
-            let result = payload["result"] as? [String: Any],
-            let data = result["data"] as? [[String: Any]]
-        else { return }
+    private func handleThreadListResponse(id: Int, payload: [String: Any]) {
+        let context = threadListRequestContextsByRequestID.removeValue(forKey: id)
+        let extracted = extractThreadListPayload(from: payload["result"])
+        let rawThreadIDs = extracted.threadIDs
+        let rawThreads = extracted.threads
 
-        let parsed = data.compactMap(parseThread)
+        var parsed = rawThreads.compactMap { raw in
+            parseThread(raw) ?? (raw["thread"] as? [String: Any]).flatMap(parseThread)
+        }
+        let normalizedThreadIDs = normalizedThreadIDs(from: rawThreadIDs)
+        if !normalizedThreadIDs.isEmpty {
+            let existingByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0) })
+            let placeholders = normalizedThreadIDs.map { threadID in
+                existingByID[threadID] ?? AppThread(
+                    id: threadID,
+                    cwd: "",
+                    title: "Thread \(threadID.prefix(8))",
+                    subtitle: String(threadID.prefix(8)),
+                    updatedAt: .distantPast
+                )
+            }
+            parsed.append(contentsOf: placeholders)
+            requestThreadSummariesIfNeededLocked(threadIDs: normalizedThreadIDs)
+        }
 
+        parsed = deduplicatedThreads(parsed)
+#if DEBUG
+        print(
+            "NexaLink thread/list parsed objects=\(rawThreads.count) ids=\(normalizedThreadIDs.count) parsed=\(parsed.count) nextCursor=\(extracted.nextCursor ?? "nil") includeSort=\(context?.includeSortKey == true) includeAllSources=\(context?.includeAllSourceKinds == true) minimal=\(context?.minimalParams == true)"
+        )
+#endif
+
+        guard let context else {
+            DispatchQueue.main.async {
+                self.threads = parsed
+            }
+            return
+        }
+
+        if context.replace && context.cursor == nil {
+            threadListAccumulator.removeAll()
+        }
+
+        for thread in parsed {
+            if let existingIndex = threadListAccumulator.firstIndex(where: { $0.id == thread.id }) {
+                threadListAccumulator[existingIndex] = thread
+            } else {
+                threadListAccumulator.append(thread)
+            }
+        }
+
+        if let nextCursor = extracted.nextCursor,
+           !nextCursor.isEmpty,
+           context.page < maxThreadListPagesPerRefresh {
+            requestThreadListLocked(
+                replace: context.replace,
+                cursor: nextCursor,
+                page: context.page + 1,
+                includeSortKey: context.includeSortKey,
+                includeAllSourceKinds: context.includeAllSourceKinds,
+                minimalParams: context.minimalParams
+            )
+            return
+        }
+
+        let finalized = threadListAccumulator.sorted { $0.updatedAt > $1.updatedAt }
+        threadListAccumulator.removeAll()
         DispatchQueue.main.async {
-            self.threads = parsed
+            self.threads = finalized
+        }
+
+        if finalized.isEmpty, context.replace, context.cursor == nil, threadListRetryCount < 2 {
+            threadListRetryCount += 1
+            let retryDelay: TimeInterval = threadListRetryCount == 1 ? 0.8 : 1.6
+            let useMinimalRetry = threadListRetryCount == 1
+            let retryIncludeAllSources = !useMinimalRetry
+            let retryIncludeSortKey = !useMinimalRetry
+            connectionQueue.asyncAfter(deadline: .now() + retryDelay) { [weak self] in
+                guard let self else { return }
+                guard self.didReceiveInitializeResponse, self.phaseIsOpenLocked() else { return }
+                self.requestThreadListLocked(
+                    replace: true,
+                    cursor: nil,
+                    includeSortKey: retryIncludeSortKey,
+                    includeAllSourceKinds: retryIncludeAllSources,
+                    minimalParams: useMinimalRetry
+                )
+            }
+        } else if !finalized.isEmpty {
+            threadListRetryCount = 0
         }
     }
 
     private func handleThreadReadResponse(id: Int, payload: [String: Any]) {
+        let isSummaryRequest = threadReadSummaryRequestIDs.remove(id) != nil
         let requestedThreadID = threadReadThreadIDByRequestID.removeValue(forKey: id)
         guard
             let result = payload["result"] as? [String: Any],
             let thread = result["thread"] as? [String: Any]
         else {
+            if isSummaryRequest { return }
             DispatchQueue.main.async {
                 self.statusMessage = "thread/read returned unexpected payload."
             }
@@ -697,6 +908,7 @@ final class AppServerConnection: ObservableObject {
         upsertThread(from: thread)
         let threadID = (thread["id"] as? String) ?? requestedThreadID
         guard let threadID else { return }
+        guard !isSummaryRequest else { return }
 
         let turns = thread["turns"] as? [[String: Any]] ?? []
         cacheThreadMappingsFromTurns(turns, threadID: threadID)
@@ -707,6 +919,25 @@ final class AppServerConnection: ObservableObject {
             self.statusMessage = rebuiltActivity.isEmpty
                 ? "Connected. No messages in selected thread."
                 : "Loaded \(rebuiltActivity.count) messages from thread."
+        }
+    }
+
+    private func handleThreadArchiveResponse(id: Int) {
+        let archivedThreadID = threadArchiveThreadIDByRequestID.removeValue(forKey: id)
+        if let archivedThreadID {
+            removeThreadLocally(threadID: archivedThreadID)
+        } else {
+            requestThreadList()
+        }
+
+        if let completion = threadArchiveCompletionsByRequestID.removeValue(forKey: id) {
+            DispatchQueue.main.async {
+                completion(true, nil)
+            }
+        }
+
+        DispatchQueue.main.async {
+            self.statusMessage = "Thread archived."
         }
     }
 
@@ -744,6 +975,13 @@ final class AppServerConnection: ObservableObject {
             if let thread = params["thread"] as? [String: Any] {
                 upsertThread(from: thread)
             }
+
+        case "thread/archived", "thread_archived":
+            guard let threadID = stringValue(in: params, keys: ["threadId", "thread_id"]) else { return }
+            removeThreadLocally(threadID: threadID)
+
+        case "thread/unarchived", "thread_unarchived":
+            requestThreadList()
 
         case "thread/name/updated", "thread_name_updated":
             guard
@@ -1226,11 +1464,13 @@ final class AppServerConnection: ObservableObject {
     }
 
     private func parseThread(_ raw: [String: Any]) -> AppThread? {
-        guard let threadID = raw["id"] as? String else { return nil }
-        let cwd = (raw["cwd"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let preview = (raw["preview"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let threadID = stringValue(in: raw, keys: ["id", "threadId", "thread_id"]) else { return nil }
+        let cwd = stringValue(in: raw, keys: ["cwd", "workingDirectory", "working_directory"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let preview = stringValue(in: raw, keys: ["preview", "title", "name"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let title = preview.isEmpty ? "Thread \(threadID.prefix(8))" : preview
-        let updatedAt = dateFromUnixSeconds(raw["updatedAt"]) ?? Date()
+        let updatedAt = dateFromUnixSeconds(raw["updatedAt"] ?? raw["updated_at"]) ?? Date()
         return AppThread(
             id: threadID,
             cwd: cwd,
@@ -1238,6 +1478,113 @@ final class AppServerConnection: ObservableObject {
             subtitle: String(threadID.prefix(8)),
             updatedAt: updatedAt
         )
+    }
+
+    private func normalizedThreadIDs(from rawIDs: [String]) -> [String] {
+        var seen = Set<String>()
+        var normalized: [String] = []
+        for rawID in rawIDs {
+            let trimmed = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if seen.insert(trimmed).inserted {
+                normalized.append(trimmed)
+            }
+        }
+        return normalized
+    }
+
+    private func extractThreadListPayload(from resultAny: Any?) -> (threads: [[String: Any]], threadIDs: [String], nextCursor: String?) {
+        var threadObjects: [[String: Any]] = []
+        var threadIDs: [String] = []
+        var nextCursor: String?
+
+        func collectFromArray(_ array: [Any]) {
+            for element in array {
+                if let threadID = element as? String {
+                    threadIDs.append(threadID)
+                    continue
+                }
+                guard let dictionary = element as? [String: Any] else { continue }
+                if let nestedThread = dictionary["thread"] as? [String: Any] {
+                    threadObjects.append(nestedThread)
+                } else {
+                    threadObjects.append(dictionary)
+                }
+            }
+        }
+
+        func collectFromContainer(_ container: [String: Any]) {
+            if nextCursor == nil {
+                nextCursor = stringValue(in: container, keys: ["nextCursor", "next_cursor"])
+            }
+
+            for key in ["data", "threads", "items", "sessions"] {
+                if let array = container[key] as? [Any] {
+                    collectFromArray(array)
+                }
+            }
+
+            for key in ["data", "result", "threads", "items", "sessions"] {
+                if let nested = container[key] as? [String: Any] {
+                    if nextCursor == nil {
+                        nextCursor = stringValue(in: nested, keys: ["nextCursor", "next_cursor"])
+                    }
+                    for nestedKey in ["data", "threads", "items", "sessions"] {
+                        if let nestedArray = nested[nestedKey] as? [Any] {
+                            collectFromArray(nestedArray)
+                        }
+                    }
+                }
+            }
+        }
+
+        if let container = resultAny as? [String: Any] {
+            collectFromContainer(container)
+        } else if let array = resultAny as? [Any] {
+            collectFromArray(array)
+        }
+
+        return (threadObjects, normalizedThreadIDs(from: threadIDs), nextCursor)
+    }
+
+    private func requestThreadSummariesIfNeededLocked(threadIDs: [String]) {
+        let knownThreadIDs = Set(threads.map(\.id))
+        let pendingThreadIDs = Set(threadReadThreadIDByRequestID.values)
+        for threadID in threadIDs {
+            if knownThreadIDs.contains(threadID) || pendingThreadIDs.contains(threadID) {
+                continue
+            }
+            let requestID = sendRequestLocked(
+                method: "thread/read",
+                params: [
+                    "threadId": threadID,
+                    "includeTurns": false
+                ]
+            )
+            threadReadThreadIDByRequestID[requestID] = threadID
+            threadReadSummaryRequestIDs.insert(requestID)
+        }
+    }
+
+    private func deduplicatedThreads(_ threads: [AppThread]) -> [AppThread] {
+        var mergedByID: [String: AppThread] = [:]
+        for thread in threads {
+            if let existing = mergedByID[thread.id] {
+                let existingIsPlaceholder = existing.updatedAt == .distantPast
+                let incomingIsPlaceholder = thread.updatedAt == .distantPast
+
+                if existingIsPlaceholder && !incomingIsPlaceholder {
+                    mergedByID[thread.id] = thread
+                } else if existing.updatedAt < thread.updatedAt {
+                    mergedByID[thread.id] = thread
+                } else if existing.cwd.isEmpty && !thread.cwd.isEmpty {
+                    mergedByID[thread.id] = thread
+                }
+            } else {
+                mergedByID[thread.id] = thread
+            }
+        }
+        return Array(mergedByID.values)
     }
 
     private func upsertThread(from raw: [String: Any]) {
@@ -1250,6 +1597,83 @@ final class AppServerConnection: ObservableObject {
                 self.threads[existingIndex].updatedAt = thread.updatedAt
             } else {
                 self.threads.insert(thread, at: 0)
+            }
+        }
+    }
+
+    private func requestThreadList() {
+        connectionQueue.async {
+            self.requestThreadListLocked(
+                replace: true,
+                cursor: nil,
+                page: 0,
+                includeSortKey: false,
+                includeAllSourceKinds: false
+            )
+        }
+    }
+
+    private func requestThreadListLocked(
+        replace: Bool,
+        cursor: String?,
+        page: Int = 0,
+        includeSortKey: Bool,
+        includeAllSourceKinds: Bool = false,
+        minimalParams: Bool = false
+    ) {
+        var params: [String: Any] = minimalParams ? [:] : ["limit": threadListPageSize]
+        if let cursor, !cursor.isEmpty {
+            params["cursor"] = cursor
+        }
+        if includeSortKey && !minimalParams {
+            params["sortKey"] = "updated_at"
+        }
+        if includeAllSourceKinds && !minimalParams {
+            params["sourceKinds"] = [
+                "cli",
+                "vscode",
+                "exec",
+                "appServer",
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther",
+                "unknown"
+            ]
+        }
+
+        let requestID = sendRequestLocked(method: "thread/list", params: params)
+        threadListRequestContextsByRequestID[requestID] = PendingThreadListContext(
+            replace: replace,
+            cursor: cursor,
+            page: page,
+            includeSortKey: includeSortKey,
+            includeAllSourceKinds: includeAllSourceKinds,
+            minimalParams: minimalParams
+        )
+    }
+
+    private func removeThreadLocally(threadID: String) {
+        if currentThreadID == threadID {
+            currentThreadID = nil
+        }
+        threadIDByTurnID = threadIDByTurnID.filter { $0.value != threadID }
+
+        let removedItemIDs = threadIDByItemID.compactMap { key, value -> String? in
+            value == threadID ? key : nil
+        }
+        for itemID in removedItemIDs {
+            threadIDByItemID.removeValue(forKey: itemID)
+            turnIDByItemID.removeValue(forKey: itemID)
+        }
+
+        DispatchQueue.main.async {
+            self.threads.removeAll { $0.id == threadID }
+            self.runningTasks.removeAll { $0.threadID == threadID }
+            self.activity.removeAll { $0.threadID == threadID }
+            for itemID in removedItemIDs {
+                self.assistantEntryIDByItemID.removeValue(forKey: itemID)
             }
         }
     }
@@ -1460,7 +1884,7 @@ final class AppServerConnection: ObservableObject {
             "params": params
         ]
 
-        send(payload: payload)
+        sendPayloadLocked(payload)
         return id
     }
 
@@ -1471,6 +1895,12 @@ final class AppServerConnection: ObservableObject {
     }
 
     private func sendNotification(method: String, params: [String: Any]?) {
+        connectionQueue.async {
+            self.sendNotificationLocked(method: method, params: params)
+        }
+    }
+
+    private func sendNotificationLocked(method: String, params: [String: Any]?) {
         var payload: [String: Any] = [
             "jsonrpc": "2.0",
             "method": method
@@ -1480,27 +1910,21 @@ final class AppServerConnection: ObservableObject {
             payload["params"] = params
         }
 
-        send(payload: payload)
+        sendPayloadLocked(payload)
     }
 
-    private func send(payload: [String: Any]) {
+    private func sendPayloadLocked(_ payload: [String: Any]) {
         guard
             let data = try? JSONSerialization.data(withJSONObject: payload),
             let text = String(data: data, encoding: .utf8)
         else { return }
 
         let line = text.hasSuffix("\n") ? text : text + "\n"
-        sendText(line)
-    }
-
-    private func sendText(_ text: String) {
-        connectionQueue.async {
-            guard self.phaseIsOpenLocked() else {
-                self.queuedMessages.append(text)
-                return
-            }
-            self.sendFrameLocked(opcode: 0x1, payload: Data(text.utf8))
+        guard phaseIsOpenLocked() else {
+            queuedMessages.append(line)
+            return
         }
+        sendFrameLocked(opcode: 0x1, payload: Data(line.utf8))
     }
 
     private func parseRequestID(_ value: Any?) -> Int? {
@@ -1549,7 +1973,13 @@ final class AppServerConnection: ObservableObject {
         passiveThreadResumeRequestIDs.removeAll()
         turnStartContextsByRequestID.removeAll()
         threadReadThreadIDByRequestID.removeAll()
+        threadReadSummaryRequestIDs.removeAll()
+        threadListRequestContextsByRequestID.removeAll()
+        threadListAccumulator.removeAll()
+        threadListRetryCount = 0
+        threadArchiveThreadIDByRequestID.removeAll()
         threadCreateCompletionsByRequestID.removeAll()
+        threadArchiveCompletionsByRequestID.removeAll()
         commandExecCompletionsByRequestID.removeAll()
         assistantEntryIDByItemID.removeAll()
         modelListAccumulator.removeAll()
@@ -1688,7 +2118,7 @@ final class AppServerConnection: ObservableObject {
             "Connection: Upgrade",
             "Sec-WebSocket-Key: \(key)",
             "Sec-WebSocket-Version: 13",
-            "User-Agent: schema-agent/0.1.0"
+            "User-Agent: NexaLink/0.1.0"
         ]
         let request = requestLines.joined(separator: "\r\n") + "\r\n\r\n"
 
@@ -1748,8 +2178,8 @@ final class AppServerConnection: ObservableObject {
         cancelConnectTimeoutLocked()
         DispatchQueue.main.async {
             self.statusMessage = "Socket open (raw WS), sending initialize..."
-            self.sendInitializeRequest()
         }
+        sendInitializeRequestLocked()
 
         if !queuedMessages.isEmpty {
             let buffered = queuedMessages
@@ -1773,9 +2203,24 @@ final class AppServerConnection: ObservableObject {
         while let frame = decodeNextFrameLocked() {
             switch frame.opcode {
             case 0x1:
-                if let text = String(data: frame.payload, encoding: .utf8) {
+                if frame.fin {
+                    if let text = String(data: frame.payload, encoding: .utf8) {
+                        handleIncomingText(text)
+                    }
+                } else {
+                    fragmentedMessageOpcode = 0x1
+                    fragmentedMessageBuffer = frame.payload
+                }
+            case 0x0:
+                guard let fragmentedOpcode = fragmentedMessageOpcode else { continue }
+                fragmentedMessageBuffer.append(frame.payload)
+                guard frame.fin else { continue }
+                if fragmentedOpcode == 0x1,
+                   let text = String(data: fragmentedMessageBuffer, encoding: .utf8) {
                     handleIncomingText(text)
                 }
+                fragmentedMessageOpcode = nil
+                fragmentedMessageBuffer.removeAll(keepingCapacity: true)
             case 0x8:
                 var closeCode = 1000
                 var reason = ""
@@ -1800,11 +2245,12 @@ final class AppServerConnection: ObservableObject {
         }
     }
 
-    private func decodeNextFrameLocked() -> (opcode: UInt8, payload: Data)? {
+    private func decodeNextFrameLocked() -> (fin: Bool, opcode: UInt8, payload: Data)? {
         guard receiveBuffer.count >= 2 else { return nil }
 
         let first = receiveBuffer[0]
         let second = receiveBuffer[1]
+        let fin = (first & 0x80) != 0
         let opcode = first & 0x0F
         let isMasked = (second & 0x80) != 0
         var length = Int(second & 0x7F)
@@ -1846,7 +2292,7 @@ final class AppServerConnection: ObservableObject {
             payload = unmasked[...]
         }
 
-        return (opcode, Data(payload))
+        return (fin, opcode, Data(payload))
     }
 
     private func sendFrameLocked(opcode: UInt8, payload: Data) {
@@ -1893,6 +2339,12 @@ final class AppServerConnection: ObservableObject {
         connection?.cancel()
         connection = nil
         receiveBuffer.removeAll()
+        fragmentedMessageOpcode = nil
+        fragmentedMessageBuffer.removeAll()
+        threadReadSummaryRequestIDs.removeAll()
+        threadListRequestContextsByRequestID.removeAll()
+        threadListAccumulator.removeAll()
+        threadListRetryCount = 0
         activeHandshakeKey = nil
         connectedURL = nil
     }
@@ -2036,15 +2488,57 @@ struct SavedAppServerConnection: Identifiable, Codable, Hashable {
         case port
         case isEnabled
         case colorHex
+        case ipAddress
+        case connectionIPAddress
+        case url
+        case serverURLString
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(String.self, forKey: .id)
-        name = try container.decode(String.self, forKey: .name)
-        host = try container.decode(String.self, forKey: .host)
-        port = try container.decode(String.self, forKey: .port)
-        isEnabled = try container.decode(Bool.self, forKey: .isEnabled)
+
+        let decodedID = (try? container.decode(String.self, forKey: .id))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        id = (decodedID?.isEmpty == false) ? decodedID! : UUID().uuidString
+
+        let decodedName = (try? container.decode(String.self, forKey: .name))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        name = (decodedName?.isEmpty == false) ? decodedName! : "Connection"
+
+        let decodedHost = (try? container.decode(String.self, forKey: .host))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let decodedLegacyIP = (
+            (try? container.decode(String.self, forKey: .ipAddress))
+                ?? (try? container.decode(String.self, forKey: .connectionIPAddress))
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let decodedPort = (try? container.decode(String.self, forKey: .port))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var resolvedHost = decodedHost
+        var resolvedPort = decodedPort
+        if (resolvedHost == nil || resolvedHost?.isEmpty == true),
+           let legacyURL = (
+            (try? container.decode(String.self, forKey: .url))
+                ?? (try? container.decode(String.self, forKey: .serverURLString))
+           )?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !legacyURL.isEmpty {
+            var normalizedURL = legacyURL
+            if !normalizedURL.contains("://") {
+                normalizedURL = "ws://\(normalizedURL)"
+            }
+            if let components = URLComponents(string: normalizedURL),
+               let parsedHost = components.host,
+               !parsedHost.isEmpty {
+                resolvedHost = parsedHost
+                if let parsedPort = components.port {
+                    resolvedPort = String(parsedPort)
+                }
+            }
+        }
+
+        host = (resolvedHost?.isEmpty == false) ? resolvedHost! : (decodedLegacyIP?.isEmpty == false ? decodedLegacyIP! : "127.0.0.1")
+        port = (resolvedPort?.isEmpty == false) ? resolvedPort! : "9281"
+        isEnabled = (try? container.decode(Bool.self, forKey: .isEnabled)) ?? true
         let decodedColorHex = try container.decodeIfPresent(String.self, forKey: .colorHex)
         colorHex = normalizedHexColor(decodedColorHex ?? SavedAppServerConnection.defaultColorHex)
     }
@@ -2122,12 +2616,16 @@ final class MultiAppServerConnectionStore: ObservableObject {
     @Published private(set) var taskStartSuccessCount = 0
     @Published private(set) var connectedEnabledCount = 0
     @Published private(set) var enabledCount = 0
+    @Published private(set) var activityChangeCounter = 0
 
     private var serversByConnectionID: [String: AppServerConnection] = [:]
-    private var serverChangeSubscriptions: [String: AnyCancellable] = [:]
+    private var serverDerivedStateSubscriptions: [String: AnyCancellable] = [:]
+    private var activitySubscriptions: [String: AnyCancellable] = [:]
     private var taskStartCountSubscriptions: [String: AnyCancellable] = [:]
     private var latestTaskStartCountByConnectionID: [String: Int] = [:]
+    private var latestObservedStateByConnectionID: [String: AppServerConnectionState] = [:]
     private var mergedThreadLookup: [String: (connectionID: String, rawThreadID: String)] = [:]
+    private var isRecomputeScheduled = false
 
     private let savedConnectionsKey = "savedAppServerConnectionsV1"
     private let legacyURLKey = "preferredAppServerURL"
@@ -2143,7 +2641,8 @@ final class MultiAppServerConnectionStore: ObservableObject {
         for server in serversByConnectionID.values {
             server.disconnect()
         }
-        serverChangeSubscriptions.values.forEach { $0.cancel() }
+        serverDerivedStateSubscriptions.values.forEach { $0.cancel() }
+        activitySubscriptions.values.forEach { $0.cancel() }
         taskStartCountSubscriptions.values.forEach { $0.cancel() }
     }
 
@@ -2209,7 +2708,7 @@ final class MultiAppServerConnectionStore: ObservableObject {
         guard connections[index].colorHex != normalized else { return }
         connections[index].colorHex = normalized
         persistConnections()
-        recomputeDerivedState()
+        scheduleRecomputeDerivedState()
     }
 
     func availableModels(for selectedMergedThreadID: String?) -> [AppServerModelOption] {
@@ -2296,6 +2795,25 @@ final class MultiAppServerConnectionStore: ObservableObject {
             return
         }
         server.loadThreadHistory(threadID: resolved.rawThreadID)
+    }
+
+    func archiveThread(
+        mergedThreadID: String,
+        completion: @escaping (_ success: Bool, _ errorMessage: String?) -> Void
+    ) {
+        guard
+            let resolved = resolvedSelectedThreadContext(for: mergedThreadID),
+            let connection = connections.first(where: { $0.id == resolved.connection.id }),
+            connection.isEnabled,
+            let server = serversByConnectionID[resolved.connection.id]
+        else {
+            completion(false, "Thread is unavailable.")
+            return
+        }
+
+        server.archiveThread(threadID: resolved.rawThreadID) { success, errorMessage in
+            completion(success, errorMessage)
+        }
     }
 
     @discardableResult
@@ -2411,7 +2929,6 @@ final class MultiAppServerConnectionStore: ObservableObject {
         server.createThread(cwd: trimmedCwd) { [weak self] rawThreadID, errorMessage in
             guard let self else { return }
             if let rawThreadID {
-                self.recomputeDerivedState()
                 completion(self.mergedThreadID(connectionID: connectionID, rawThreadID: rawThreadID), nil)
             } else {
                 completion(nil, errorMessage ?? "Failed to create thread.")
@@ -2493,9 +3010,29 @@ final class MultiAppServerConnectionStore: ObservableObject {
     }
 
     private func observe(server: AppServerConnection, connectionID: String) {
-        serverChangeSubscriptions[connectionID] = server.objectWillChange.sink { [weak self] _ in
+        let statePublisher = server.$state.map { _ in () }.eraseToAnyPublisher()
+        let threadsPublisher = server.$threads.map { _ in () }.eraseToAnyPublisher()
+        let runningTasksPublisher = server.$runningTasks.map { _ in () }.eraseToAnyPublisher()
+        let submittingPublisher = server.$isSubmittingTask.map { _ in () }.eraseToAnyPublisher()
+        let modelsPublisher = server.$availableModels.map { _ in () }.eraseToAnyPublisher()
+
+        serverDerivedStateSubscriptions[connectionID] = Publishers.MergeMany(
+            statePublisher,
+            threadsPublisher,
+            runningTasksPublisher,
+            submittingPublisher,
+            modelsPublisher
+        )
+        .sink { [weak self] _ in
+            guard let self else { return }
+            let newState = server.state
+            self.latestObservedStateByConnectionID[connectionID] = newState
+            self.scheduleRecomputeDerivedState()
+        }
+
+        activitySubscriptions[connectionID] = server.$activity.sink { [weak self] _ in
             DispatchQueue.main.async {
-                self?.recomputeDerivedState()
+                self?.activityChangeCounter &+= 1
             }
         }
 
@@ -2513,7 +3050,7 @@ final class MultiAppServerConnectionStore: ObservableObject {
             taskStartSuccessCount += (newValue - previous)
         }
         latestTaskStartCountByConnectionID[connectionID] = newValue
-        recomputeDerivedState()
+        scheduleRecomputeDerivedState()
     }
 
     private func reconcileConnections() {
@@ -2523,9 +3060,11 @@ final class MultiAppServerConnectionStore: ObservableObject {
         for connectionID in staleConnectionIDs {
             serversByConnectionID[connectionID]?.disconnect()
             serversByConnectionID.removeValue(forKey: connectionID)
-            serverChangeSubscriptions.removeValue(forKey: connectionID)?.cancel()
+            serverDerivedStateSubscriptions.removeValue(forKey: connectionID)?.cancel()
+            activitySubscriptions.removeValue(forKey: connectionID)?.cancel()
             taskStartCountSubscriptions.removeValue(forKey: connectionID)?.cancel()
             latestTaskStartCountByConnectionID.removeValue(forKey: connectionID)
+            latestObservedStateByConnectionID.removeValue(forKey: connectionID)
         }
 
         for connection in connections {
@@ -2538,6 +3077,8 @@ final class MultiAppServerConnectionStore: ObservableObject {
                 observe(server: created, connectionID: connection.id)
                 server = created
             }
+
+            latestObservedStateByConnectionID[connection.id] = server.state
 
             let targetURL = connection.urlString
             let urlChanged = server.serverURLString != targetURL
@@ -2559,7 +3100,17 @@ final class MultiAppServerConnectionStore: ObservableObject {
             }
         }
 
-        recomputeDerivedState()
+        scheduleRecomputeDerivedState()
+    }
+
+    private func scheduleRecomputeDerivedState() {
+        guard !isRecomputeScheduled else { return }
+        isRecomputeScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isRecomputeScheduled = false
+            self.recomputeDerivedState()
+        }
     }
 
     private func recomputeDerivedState() {
@@ -2624,12 +3175,22 @@ final class MultiAppServerConnectionStore: ObservableObject {
         updatedMergedThreads.sort { $0.updatedAt > $1.updatedAt }
         updatedMergedRunningTasks.sort { $0.startedAt > $1.startedAt }
 
-        connectionStatuses = updatedStatuses
+        if connectionStatuses != updatedStatuses {
+            connectionStatuses = updatedStatuses
+        }
         mergedThreadLookup = updatedThreadLookup
-        mergedThreads = updatedMergedThreads
-        mergedRunningTasks = updatedMergedRunningTasks
-        self.enabledCount = enabledCount
-        connectedEnabledCount = connectedCount
+        if mergedThreads != updatedMergedThreads {
+            mergedThreads = updatedMergedThreads
+        }
+        if mergedRunningTasks != updatedMergedRunningTasks {
+            mergedRunningTasks = updatedMergedRunningTasks
+        }
+        if self.enabledCount != enabledCount {
+            self.enabledCount = enabledCount
+        }
+        if connectedEnabledCount != connectedCount {
+            connectedEnabledCount = connectedCount
+        }
     }
 
     private func loadSavedConnections() {
@@ -2731,12 +3292,19 @@ struct ContentView: View {
     @State private var editConnectionColor = colorFromHex(SavedAppServerConnection.defaultColorHex)
     @State private var pendingDeleteConnectionID: String?
     @State private var pendingDeleteConnectionName = ""
+    @State private var archivingThreadIDs: Set<String> = []
+    @State private var archiveErrorMessage: String?
     @State private var newTaskPrompt = ""
+    @State private var composerMeasuredHeight: CGFloat = 0
     @State private var selectedModelOverride = ""
     @State private var selectedEffortOverride = ""
     @State private var shouldScrollConversationToBottomOnNextUpdate = true
     @State private var isConversationBottomVisible = true
     @State private var isRunningTasksExpanded = true
+    @State private var projectSectionsCache: [ProjectSection] = []
+    @State private var visibleActivityCache: [ActivityEntry] = []
+    @State private var inlineRunningTasksCache: [MergedRunningTask] = []
+    @FocusState private var isComposerFocused: Bool
 
     private let conversationBottomAnchorID = "conversation-bottom-anchor"
 
@@ -2920,23 +3488,12 @@ struct ContentView: View {
         return false
     }
 
-    private var selectedThreadTitle: String {
-        if let selectedThreadID {
-            return connectionStore.selectedThreadTitle(for: selectedThreadID)
-        }
-        if let selectedProjectContext {
-            return projectTitle(for: selectedProjectContext.projectPath)
-        }
-        return "New thread"
-    }
-
     private var visibleActivity: [ActivityEntry] {
-        connectionStore.activityEntries(for: selectedThreadID)
+        visibleActivityCache
     }
 
     private var inlineRunningTasks: [MergedRunningTask] {
-        guard let selectedThreadID else { return [] }
-        return connectionStore.mergedRunningTasks.filter { $0.mergedThreadID == selectedThreadID }
+        inlineRunningTasksCache
     }
 
     private var connectProjectAvailableConnections: [ConnectionStatus] {
@@ -3020,22 +3577,26 @@ struct ContentView: View {
     private var visibleActivityScrollToken: Int {
         var hasher = Hasher()
         hasher.combine(selectedThreadID)
-        for entry in visibleActivity {
-            hasher.combine(entry.id)
-            hasher.combine(entry.text.count)
-            hasher.combine(entry.imageURLs.count)
-            hasher.combine(entry.localImagePaths.count)
+        hasher.combine(visibleActivity.count)
+        if let lastEntry = visibleActivity.last {
+            hasher.combine(lastEntry.id)
+            hasher.combine(lastEntry.text.count)
+            hasher.combine(lastEntry.imageURLs.count)
+            hasher.combine(lastEntry.localImagePaths.count)
         }
-        for task in inlineRunningTasks {
-            hasher.combine(task.id)
-            hasher.combine(task.name)
-            hasher.combine(task.type)
-            hasher.combine(task.startedAt.timeIntervalSince1970)
+        hasher.combine(inlineRunningTasks.count)
+        if let firstTask = inlineRunningTasks.first {
+            hasher.combine(firstTask.id)
+            hasher.combine(firstTask.startedAt.timeIntervalSince1970)
         }
         return hasher.finalize()
     }
 
     private var projectSections: [ProjectSection] {
+        projectSectionsCache
+    }
+
+    private func buildProjectSections() -> [ProjectSection] {
         var groupedThreads: [String: [MergedAppThread]] = [:]
         var groupOrder: [String] = []
 
@@ -3103,34 +3664,114 @@ struct ContentView: View {
         activeModelOptions.map(\.model)
     }
 
+    private var composerMinLines: Int {
+        isIPhone ? 1 : 3
+    }
+
+    private var composerMaxLines: Int {
+        isIPhone ? 10 : 15
+    }
+
+    private var composerFieldVerticalPadding: CGFloat {
+        isIPhone ? 8 : 10
+    }
+
+    private var composerLineHeight: CGFloat {
+        #if os(macOS)
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        return ceil(font.ascender - font.descender + font.leading)
+        #else
+        UIFont.preferredFont(forTextStyle: .body).lineHeight
+        #endif
+    }
+
+    private var composerMinHeight: CGFloat {
+        CGFloat(composerMinLines) * composerLineHeight + (composerFieldVerticalPadding * 2)
+    }
+
+    private var composerMaxHeight: CGFloat {
+        CGFloat(composerMaxLines) * composerLineHeight + (composerFieldVerticalPadding * 2)
+    }
+
+    private var composerResolvedHeight: CGFloat {
+        let measured = composerMeasuredHeight > 0 ? composerMeasuredHeight : composerMinHeight
+        return min(max(measured, composerMinHeight), composerMaxHeight)
+    }
+
+    private func refreshProjectSectionsCache() {
+        projectSectionsCache = buildProjectSections()
+    }
+
+    private func refreshVisibleConversationCache() {
+        visibleActivityCache = connectionStore.activityEntries(for: selectedThreadID)
+        if let selectedThreadID {
+            inlineRunningTasksCache = connectionStore.mergedRunningTasks.filter { $0.mergedThreadID == selectedThreadID }
+        } else {
+            inlineRunningTasksCache = []
+        }
+    }
+
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebarColumn
         } detail: {
             detailColumn
         }
-        .onAppear(perform: configureInitialSidebarVisibility)
+        .onAppear {
+            configureInitialSidebarVisibility()
+            DispatchQueue.main.async {
+                refreshProjectSectionsCache()
+                refreshVisibleConversationCache()
+            }
+        }
+        .onReceive(connectionStore.$activityChangeCounter) { _ in
+            DispatchQueue.main.async {
+                refreshVisibleConversationCache()
+            }
+        }
+        .onReceive(connectionStore.$mergedRunningTasks) { _ in
+            DispatchQueue.main.async {
+                refreshVisibleConversationCache()
+            }
+        }
         .onChange(of: inlineRunningTasks.map(\.id)) { _, taskIDs in
             if !taskIDs.isEmpty {
                 isRunningTasksExpanded = true
             }
         }
-        .onChange(of: connectionStore.mergedThreads.map(\.id)) { _, threadIDs in
+        .onReceive(connectionStore.$mergedThreads) { mergedThreads in
+            let threadIDs = Set(mergedThreads.map(\.id))
             if let selectedThreadID, !threadIDs.contains(selectedThreadID) {
-                self.selectedThreadID = nil
+                DispatchQueue.main.async {
+                    if self.selectedThreadID == selectedThreadID {
+                        self.selectedThreadID = nil
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                refreshProjectSectionsCache()
             }
         }
-        .onChange(of: connectionStore.connectionStatuses.map(\.id)) { _, connectionIDs in
-            let validConnectionIDs = Set(connectionIDs)
-            connectedProjects.removeAll { !validConnectionIDs.contains($0.connectionID) }
-            if let selectedProjectID,
-               let parsed = parseProjectSelectionID(selectedProjectID),
-               !validConnectionIDs.contains(parsed.connectionID) {
-                self.selectedProjectID = nil
+        .onReceive(connectionStore.$connectionStatuses) { statuses in
+            let validConnectionIDs = Set(statuses.map(\.id))
+            DispatchQueue.main.async {
+                self.connectedProjects.removeAll { !validConnectionIDs.contains($0.connectionID) }
+                if let selectedProjectID = self.selectedProjectID,
+                   let parsed = self.parseProjectSelectionID(selectedProjectID),
+                   !validConnectionIDs.contains(parsed.connectionID) {
+                    self.selectedProjectID = nil
+                }
+                refreshProjectSectionsCache()
+            }
+        }
+        .onChange(of: connectedProjects.map(\.id)) { _, _ in
+            DispatchQueue.main.async {
+                refreshProjectSectionsCache()
             }
         }
         .onChange(of: connectionStore.taskStartSuccessCount) { _, _ in
             newTaskPrompt = ""
+            dismissComposerFocus()
             if selectedThreadID == nil {
                 if let selectedProjectID,
                    let matchingThread = connectionStore.mergedThreads.first(where: { thread in
@@ -3157,8 +3798,12 @@ struct ContentView: View {
         }
         .onChange(of: selectedThreadID) { _, threadID in
             shouldScrollConversationToBottomOnNextUpdate = true
+            dismissComposerFocus()
             if threadID != nil {
                 selectedProjectID = nil
+            }
+            DispatchQueue.main.async {
+                refreshVisibleConversationCache()
             }
             guard let threadID else { return }
             connectionStore.loadThreadHistory(for: threadID)
@@ -3168,6 +3813,18 @@ struct ContentView: View {
         }
         .sheet(isPresented: $isSettingsPresented) {
             settingsModal
+        }
+        .alert("Archive Failed", isPresented: Binding(
+            get: { archiveErrorMessage != nil },
+            set: { isPresented in
+                if !isPresented {
+                    archiveErrorMessage = nil
+                }
+            }
+        )) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(archiveErrorMessage ?? "Failed to archive thread.")
         }
     }
 
@@ -3197,87 +3854,7 @@ struct ContentView: View {
 
             List(selection: $selectedThreadID) {
                 ForEach(projectSections) { section in
-                    Section {
-                        Button {
-                            selectedProjectID = section.id
-                            selectedThreadID = nil
-                            shouldScrollConversationToBottomOnNextUpdate = true
-                        } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: "plus.bubble")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(section.threads.isEmpty ? "No threads yet" : "Start new thread")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Spacer(minLength: 0)
-                            }
-                            .padding(.vertical, 2)
-                        }
-                        .buttonStyle(.plain)
-                        .listRowBackground(
-                            (selectedThreadID == nil && selectedProjectID == section.id)
-                            ? Color.accentColor.opacity(0.12)
-                            : Color.clear
-                        )
-
-                        ForEach(section.threads) { thread in
-                            let isRunning = runningThreadIDs.contains(thread.id)
-                            HStack(alignment: .center, spacing: 10) {
-                                Group {
-                                    if isRunning {
-                                        ProgressView()
-                                            .progressViewStyle(.circular)
-                                            .controlSize(.small)
-                                    } else {
-                                        Color.clear
-                                    }
-                                }
-                                .frame(width: 12, height: 12)
-
-                                Text(thread.title)
-                                    .font(.subheadline)
-                                    .lineLimit(1)
-
-                                Spacer(minLength: 6)
-
-                                Text(thread.updatedAtText)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.vertical, 2)
-                            .tag(thread.id)
-                        }
-                    } header: {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "folder")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(section.title)
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                            Text(section.connectionName)
-                                .font(.caption2.weight(.semibold))
-                                .foregroundColor(colorFromHex(section.connectionColorHex))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(
-                                    Capsule()
-                                        .fill(colorFromHex(section.connectionColorHex).opacity(0.14))
-                                )
-                            if let subtitle = section.subtitle {
-                                Text("•")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                Text(subtitle)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                        }
-                        .textCase(nil)
-                    }
+                    projectSection(section)
                 }
             }
             .listStyle(.sidebar)
@@ -3296,36 +3873,149 @@ struct ContentView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
         }
-        .navigationTitle("schema-agent")
+        .navigationTitle("NexaLink")
     }
 
     private var detailColumn: some View {
         VStack(spacing: 0) {
-            threadHeader
-            Divider()
             conversationView
             Divider()
             composer
         }
     }
 
-    private var threadHeader: some View {
-        HStack(spacing: 10) {
-            Text(selectedThreadTitle)
-                .font(.title3.weight(.semibold))
-                .lineLimit(1)
-            Spacer()
-            Text(connectionStore.connectionSummaryLabel)
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    (connectionStore.connectedEnabledCount > 0 ? Color.green : Color.gray).opacity(0.15),
-                    in: Capsule()
-                )
+    @ViewBuilder
+    private func projectSection(_ section: ProjectSection) -> some View {
+        Section {
+            ForEach(section.threads) { thread in
+                projectThreadRow(thread)
+            }
+
+            if section.threads.isEmpty {
+                Text("No threads yet")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 2)
+            }
+        } header: {
+            projectSectionHeader(section)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
+    }
+
+    private func projectThreadRow(_ thread: MergedAppThread) -> some View {
+        let isRunning = runningThreadIDs.contains(thread.id)
+        let isArchiving = archivingThreadIDs.contains(thread.id)
+        return HStack(alignment: .center, spacing: 10) {
+            Group {
+                if isRunning {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(width: 12, height: 12)
+
+            Text(thread.title)
+                .font(.subheadline)
+                .lineLimit(1)
+
+            Spacer(minLength: 6)
+
+            Text(thread.updatedAtText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+        .tag(thread.id)
+        .contextMenu {
+            Button(role: .destructive) {
+                archiveThread(thread)
+            } label: {
+                Label("Archive", systemImage: "archivebox")
+            }
+            .disabled(isArchiving)
+        }
+    }
+
+    private func projectSectionHeader(_ section: ProjectSection) -> some View {
+        let isProjectSelected = selectedThreadID == nil && selectedProjectID == section.id
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "folder")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text(section.title)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(isProjectSelected ? Color.accentColor : Color.primary)
+                .lineLimit(1)
+
+            Text(section.connectionName)
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(colorFromHex(section.connectionColorHex))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule()
+                        .fill(colorFromHex(section.connectionColorHex).opacity(0.14))
+                )
+
+            if let subtitle = section.subtitle {
+                Text("•")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            if !usesCompactSettingsLayout {
+                Spacer(minLength: 0)
+            }
+
+            Button {
+                beginNewThread(in: section.id)
+            } label: {
+                Image(systemName: "plus")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(.plain)
+            .help("Start new thread")
+        }
+        .textCase(nil)
+    }
+
+    private func beginNewThread(in projectID: String) {
+        selectedProjectID = projectID
+        selectedThreadID = nil
+        shouldScrollConversationToBottomOnNextUpdate = true
+    }
+
+    private func archiveThread(_ thread: MergedAppThread) {
+        let mergedThreadID = thread.id
+        guard !archivingThreadIDs.contains(mergedThreadID) else { return }
+        archivingThreadIDs.insert(mergedThreadID)
+
+        connectionStore.archiveThread(mergedThreadID: mergedThreadID) { success, errorMessage in
+            archivingThreadIDs.remove(mergedThreadID)
+            guard success else {
+                if let errorMessage, !errorMessage.isEmpty {
+                    archiveErrorMessage = errorMessage
+                } else {
+                    archiveErrorMessage = "Could not archive \"\(thread.title)\"."
+                }
+                return
+            }
+
+            if selectedThreadID == mergedThreadID {
+                selectedThreadID = nil
+            }
+            shouldScrollConversationToBottomOnNextUpdate = true
+        }
     }
 
     private var connectProjectWizard: some View {
@@ -3666,31 +4356,54 @@ struct ContentView: View {
     }
 
     private var settingsModal: some View {
-        NavigationStack {
-            HStack(spacing: 0) {
-                settingsSidebar
-                    .frame(width: 220)
+        Group {
+            if usesCompactSettingsLayout {
+                NavigationStack {
+                    compactConnectionsSettings
+                        .navigationTitle("Connections")
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Close") {
+                                    isSettingsPresented = false
+                                }
+                            }
+                            ToolbarItem(placement: .primaryAction) {
+                                Button {
+                                    presentAddConnectionSheet()
+                                } label: {
+                                    Image(systemName: "plus")
+                                }
+                            }
+                        }
+                }
+            } else {
+                NavigationStack {
+                    HStack(spacing: 0) {
+                        settingsSidebar
+                            .frame(width: 220)
 
-                Divider()
+                        Divider()
 
-                Group {
-                    switch selectedSettingsSection ?? .connections {
-                    case .connections:
-                        connectionsSettings
+                        Group {
+                            switch selectedSettingsSection ?? .connections {
+                            case .connections:
+                                connectionsSettings
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    }
+                    .navigationTitle("Settings")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Close") {
+                                isSettingsPresented = false
+                            }
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            }
-            .navigationTitle("Settings")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") {
-                        isSettingsPresented = false
-                    }
-                }
+                .frame(minWidth: 780, minHeight: 500)
             }
         }
-        .frame(minWidth: 780, minHeight: 500)
     }
 
     private var settingsSidebar: some View {
@@ -3768,18 +4481,69 @@ struct ContentView: View {
         }
     }
 
+    private var compactConnectionsSettings: some View {
+        List {
+            Section {
+                Text("All enabled websocket connections auto-connect on launch.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Connections") {
+                if connectionStore.connectionStatuses.isEmpty {
+                    Text("No connections configured yet.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(connectionStore.connectionStatuses) { connection in
+                        compactConnectionRow(connection)
+                    }
+                }
+            }
+        }
+        #if os(iOS)
+        .listStyle(.insetGrouped)
+        #else
+        .listStyle(.inset)
+        #endif
+        .sheet(isPresented: $isAddConnectionPresented) {
+            addConnectionSheet
+        }
+        .sheet(isPresented: $isEditConnectionPresented) {
+            editConnectionSheet
+        }
+        .confirmationDialog(
+            "Delete Connection",
+            isPresented: Binding(
+                get: { pendingDeleteConnectionID != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        clearPendingConnectionDeletion()
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete \"\(pendingDeleteConnectionName)\"", role: .destructive) {
+                guard let connectionID = pendingDeleteConnectionID else { return }
+                connectionStore.deleteConnection(connectionID: connectionID)
+                clearPendingConnectionDeletion()
+            }
+            Button("Cancel", role: .cancel) {
+                clearPendingConnectionDeletion()
+            }
+        } message: {
+            Text("This removes the saved connection from Schema Agent.")
+        }
+    }
+
     private func connectionCard(for connection: ConnectionStatus) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(connection.name)
                     .font(.headline)
                 Spacer()
-                Toggle(isOn: Binding(
-                    get: { connection.isEnabled },
-                    set: { isEnabled in
-                        connectionStore.setConnectionEnabled(isEnabled, connectionID: connection.id)
-                    }
-                )) {
+                Toggle(isOn: connectionEnabledBinding(for: connection)) {
                     Text(connection.isEnabled ? "Enabled" : "Disabled")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
@@ -3832,18 +4596,7 @@ struct ContentView: View {
                 Text("Color")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                ColorPicker(
-                    "",
-                    selection: Binding(
-                        get: { colorFromHex(connection.colorHex) },
-                        set: { newColor in
-                            connectionStore.setConnectionColor(
-                                hexString(from: newColor),
-                                connectionID: connection.id
-                            )
-                        }
-                    )
-                )
+                ColorPicker("", selection: connectionColorBinding(for: connection))
                 .labelsHidden()
             }
 
@@ -3860,6 +4613,98 @@ struct ContentView: View {
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.secondary.opacity(0.08))
+        )
+    }
+
+    private func compactConnectionRow(_ connection: ConnectionStatus) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Text(connection.name)
+                    .font(.headline)
+                    .lineLimit(1)
+
+                Spacer(minLength: 0)
+
+                Button {
+                    presentEditConnectionSheet(connection)
+                } label: {
+                    Image(systemName: "pencil")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(Color.secondary.opacity(0.14))
+                        )
+                }
+                .buttonStyle(.plain)
+
+                Button(role: .destructive) {
+                    pendingDeleteConnectionID = connection.id
+                    pendingDeleteConnectionName = connection.name
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(Color.secondary.opacity(0.14))
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(connectionStatusColor(connection.state))
+                    .frame(width: 8, height: 8)
+                Text(connection.stateLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(connectionStatusColor(connection.state))
+            }
+
+            Text("\(connection.host)  •  Port \(connection.port)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Toggle(isOn: connectionEnabledBinding(for: connection)) {
+                Text(connection.isEnabled ? "Enabled" : "Disabled")
+                    .font(.subheadline.weight(.medium))
+            }
+            .toggleStyle(.switch)
+
+            HStack(spacing: 8) {
+                Text("Color")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                Circle()
+                    .fill(colorFromHex(connection.colorHex))
+                    .frame(width: 16, height: 16)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func connectionEnabledBinding(for connection: ConnectionStatus) -> Binding<Bool> {
+        Binding(
+            get: { connection.isEnabled },
+            set: { isEnabled in
+                connectionStore.setConnectionEnabled(isEnabled, connectionID: connection.id)
+            }
+        )
+    }
+
+    private func connectionColorBinding(for connection: ConnectionStatus) -> Binding<Color> {
+        Binding(
+            get: { colorFromHex(connection.colorHex) },
+            set: { newColor in
+                connectionStore.setConnectionColor(
+                    hexString(from: newColor),
+                    connectionID: connection.id
+                )
+            }
         )
     }
 
@@ -3951,7 +4796,19 @@ struct ContentView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 14)
         }
-        .frame(minWidth: 500, minHeight: 360)
+        .frame(
+            minWidth: usesCompactSettingsLayout ? nil : 500,
+            idealWidth: nil,
+            maxWidth: .infinity,
+            minHeight: usesCompactSettingsLayout ? nil : 360,
+            idealHeight: nil,
+            maxHeight: usesCompactSettingsLayout ? .infinity : nil,
+            alignment: .topLeading
+        )
+        #if os(iOS)
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+        #endif
     }
 
     private var editConnectionSheet: some View {
@@ -4015,7 +4872,9 @@ struct ContentView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 16)
 
-            Spacer(minLength: 0)
+            if !usesCompactSettingsLayout {
+                Spacer(minLength: 0)
+            }
 
             Divider()
 
@@ -4044,7 +4903,19 @@ struct ContentView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 14)
         }
-        .frame(minWidth: 500, minHeight: 360)
+        .frame(
+            minWidth: usesCompactSettingsLayout ? nil : 500,
+            idealWidth: nil,
+            maxWidth: .infinity,
+            minHeight: usesCompactSettingsLayout ? nil : 360,
+            idealHeight: nil,
+            maxHeight: usesCompactSettingsLayout ? .infinity : nil,
+            alignment: .topLeading
+        )
+        #if os(iOS)
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+        #endif
     }
 
     private func addConnectionField(
@@ -4132,6 +5003,14 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity)
             }
+            #if os(iOS)
+            .scrollDismissesKeyboard(.interactively)
+            .simultaneousGesture(
+                TapGesture().onEnded {
+                    dismissComposerFocus()
+                }
+            )
+            #endif
             .onAppear {
                 shouldScrollConversationToBottomOnNextUpdate = true
                 scrollConversationToBottom(using: scrollProxy, animated: false)
@@ -4152,136 +5031,147 @@ struct ContentView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 8) {
-                ZStack(alignment: .topLeading) {
-                    TextEditor(text: $newTaskPrompt)
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 86, maxHeight: 140)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-
-                    if newTaskPrompt.isEmpty {
-                        Text("Ask for follow-up changes")
-                            .font(.body)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 14)
-                            .allowsHitTesting(false)
+            #if os(macOS)
+            ZStack(alignment: .topLeading) {
+                MacComposerInputView(
+                    text: $newTaskPrompt,
+                    measuredHeight: $composerMeasuredHeight,
+                    minHeight: composerMinHeight,
+                    maxHeight: composerMaxHeight,
+                    onSubmit: {
+                        _ = startComposerTask()
                     }
+                )
+                .frame(height: composerResolvedHeight)
+
+                if newTaskPrompt.isEmpty {
+                    Text("Ask for follow-up changes")
+                        .foregroundStyle(.secondary)
+                        .allowsHitTesting(false)
+                        .padding(.horizontal, 3)
+                        .padding(.vertical, 1)
+                        .padding(.top, 1)
                 }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, composerFieldVerticalPadding)
+            #else
+            TextField(
+                "",
+                text: $newTaskPrompt,
+                prompt: Text("Ask for follow-up changes")
+                    .foregroundStyle(.secondary),
+                axis: .vertical
+            )
+            .lineLimit(composerMinLines...composerMaxLines)
+            .focused($isComposerFocused)
+            .padding(.horizontal, 10)
+            .padding(.vertical, composerFieldVerticalPadding)
+            #endif
 
-                HStack(spacing: 8) {
-                    Menu {
-                        ForEach(modelChoices) { choice in
-                            Button {
-                                selectedModelOverride = choice.value ?? ""
-                            } label: {
-                                if selectedModelValue == choice.value {
-                                    Label(choice.label, systemImage: "checkmark")
-                                } else {
-                                    Text(choice.label)
-                                }
+            HStack(spacing: 8) {
+                Menu {
+                    ForEach(modelChoices) { choice in
+                        Button {
+                            selectedModelOverride = choice.value ?? ""
+                        } label: {
+                            if selectedModelValue == choice.value {
+                                Label(choice.label, systemImage: "checkmark")
+                            } else {
+                                Text(choice.label)
                             }
                         }
-                    } label: {
-                        composerChoiceLabel(selectedModelLabel)
                     }
-                    .disabled(activeModelOptions.isEmpty)
+                } label: {
+                    composerChoiceLabel(selectedModelLabel)
+                }
+                .disabled(activeModelOptions.isEmpty)
 
-                    Menu {
-                        ForEach(effortChoices) { choice in
-                            Button {
-                                selectedEffortOverride = choice.value ?? ""
-                            } label: {
-                                if selectedEffortValue == choice.value {
-                                    Label(choice.label, systemImage: "checkmark")
-                                } else {
-                                    Text(choice.label)
-                                }
+                Menu {
+                    ForEach(effortChoices) { choice in
+                        Button {
+                            selectedEffortOverride = choice.value ?? ""
+                        } label: {
+                            if selectedEffortValue == choice.value {
+                                Label(choice.label, systemImage: "checkmark")
+                            } else {
+                                Text(choice.label)
                             }
                         }
-                    } label: {
-                        composerChoiceLabel(selectedEffortLabel)
                     }
-                    .disabled(activeModelOptions.isEmpty)
+                } label: {
+                    composerChoiceLabel(selectedEffortLabel)
+                }
+                .disabled(activeModelOptions.isEmpty)
 
-                    Spacer()
+                Spacer()
 
-                    if selectedThreadID != nil {
-                        if connectionStore.isTargetSubmittingTask(for: selectedThreadID) {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                    } else if let selectedProjectConnectionID,
-                              connectionStore.isSubmittingTask(connectionID: selectedProjectConnectionID) {
+                if selectedThreadID != nil {
+                    if connectionStore.isTargetSubmittingTask(for: selectedThreadID) {
                         ProgressView()
                             .controlSize(.small)
                     }
-
-                    Button {
-                        if let selectedThreadID {
-                            _ = connectionStore.startTask(
-                                prompt: newTaskPrompt,
-                                selectedMergedThreadID: selectedThreadID,
-                                model: selectedModelValue,
-                                effort: selectedEffortValue
-                            )
-                        } else if let selectedProjectContext,
-                                  selectedProjectContext.projectPath != "__unknown_project__" {
-                            _ = connectionStore.startTaskInProject(
-                                prompt: newTaskPrompt,
-                                connectionID: selectedProjectContext.connectionID,
-                                cwd: selectedProjectContext.projectPath,
-                                model: selectedModelValue,
-                                effort: selectedEffortValue
-                            )
-                        }
-                    } label: {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 12, weight: .semibold))
-                            .frame(width: 30, height: 30)
-                            .foregroundStyle(canStartTask ? Color.white : Color.secondary)
-                            .background(
-                                Circle()
-                                    .fill(canStartTask ? Color.black : Color.secondary.opacity(0.18))
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canStartTask)
+                } else if let selectedProjectConnectionID,
+                          connectionStore.isSubmittingTask(connectionID: selectedProjectConnectionID) {
+                    ProgressView()
+                        .controlSize(.small)
                 }
-                .padding(.horizontal, 8)
-                .padding(.bottom, 4)
-            }
-            .padding(8)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.secondary.opacity(0.06))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
-                    )
-            )
 
-            HStack {
-                if let selectedThreadID {
-                    Text("Continuing selected thread")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else if let selectedProjectContext {
-                    Text("New thread in \(projectTitle(for: selectedProjectContext.projectPath))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                } else {
-                    Text("Select a project to start a new thread")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Button {
+                    _ = startComposerTask()
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 30, height: 30)
+                        .foregroundStyle(canStartTask ? Color.white : Color.secondary)
+                        .background(
+                            Circle()
+                                .fill(canStartTask ? Color.black : Color.secondary.opacity(0.18))
+                        )
                 }
-                Spacer()
+                .buttonStyle(.plain)
+                .disabled(!canStartTask)
             }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 4)
         }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color.secondary.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                )
+        )
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+
+    @discardableResult
+    private func startComposerTask() -> Bool {
+        var started = false
+        if let selectedThreadID {
+            started = connectionStore.startTask(
+                prompt: newTaskPrompt,
+                selectedMergedThreadID: selectedThreadID,
+                model: selectedModelValue,
+                effort: selectedEffortValue
+            )
+        } else if let selectedProjectContext,
+                  selectedProjectContext.projectPath != "__unknown_project__" {
+            started = connectionStore.startTaskInProject(
+                prompt: newTaskPrompt,
+                connectionID: selectedProjectContext.connectionID,
+                cwd: selectedProjectContext.projectPath,
+                model: selectedModelValue,
+                effort: selectedEffortValue
+            )
+        }
+        if started {
+            dismissComposerFocus()
+        }
+        return started
     }
 
     private func composerChoiceLabel(_ text: String) -> some View {
@@ -4461,13 +5351,41 @@ struct ContentView: View {
             case code(language: String?, code: String)
         }
 
-        let id = UUID()
+        let id: Int
         let kind: Kind
     }
 
+    private final class MarkdownBlockCacheEntry: NSObject {
+        let blocks: [MarkdownRenderBlock]
+
+        init(blocks: [MarkdownRenderBlock]) {
+            self.blocks = blocks
+        }
+    }
+
+    private final class MarkdownInlineCacheEntry: NSObject {
+        let attributed: AttributedString
+
+        init(attributed: AttributedString) {
+            self.attributed = attributed
+        }
+    }
+
+    private static let markdownBlockCache: NSCache<NSString, MarkdownBlockCacheEntry> = {
+        let cache = NSCache<NSString, MarkdownBlockCacheEntry>()
+        cache.countLimit = 400
+        return cache
+    }()
+
+    private static let markdownInlineCache: NSCache<NSString, MarkdownInlineCacheEntry> = {
+        let cache = NSCache<NSString, MarkdownInlineCacheEntry>()
+        cache.countLimit = 1000
+        return cache
+    }()
+
     @ViewBuilder
     private func markdownText(_ source: String) -> some View {
-        let blocks = markdownBlocks(from: source)
+        let blocks = cachedMarkdownBlocks(from: source)
         VStack(alignment: .leading, spacing: 10) {
             ForEach(blocks) { block in
                 switch block.kind {
@@ -4526,18 +5444,36 @@ struct ContentView: View {
         }
     }
 
+    private func cachedMarkdownBlocks(from source: String) -> [MarkdownRenderBlock] {
+        let key = source as NSString
+        if let cached = Self.markdownBlockCache.object(forKey: key) {
+            return cached.blocks
+        }
+
+        let blocks = markdownBlocks(from: source)
+        Self.markdownBlockCache.setObject(MarkdownBlockCacheEntry(blocks: blocks), forKey: key)
+        return blocks
+    }
+
     private func markdownBlocks(from source: String) -> [MarkdownRenderBlock] {
         var blocks: [MarkdownRenderBlock] = []
+        var nextBlockID = 0
         var proseLines: [String] = []
         var codeLines: [String] = []
         var codeLanguage: String?
         var inCodeFence = false
 
+        func appendBlock(_ kind: MarkdownRenderBlock.Kind) {
+            let id = nextBlockID
+            nextBlockID += 1
+            blocks.append(MarkdownRenderBlock(id: id, kind: kind))
+        }
+
         func flushProse() {
             let prose = proseLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
             proseLines.removeAll()
             guard !prose.isEmpty else { return }
-            blocks.append(MarkdownRenderBlock(kind: .paragraph(prose)))
+            appendBlock(.paragraph(prose))
         }
 
         func flushCode() {
@@ -4547,7 +5483,7 @@ struct ContentView: View {
                 codeLanguage = nil
                 return
             }
-            blocks.append(MarkdownRenderBlock(kind: .code(language: codeLanguage, code: code)))
+            appendBlock(.code(language: codeLanguage, code: code))
             codeLanguage = nil
         }
 
@@ -4583,31 +5519,31 @@ struct ContentView: View {
 
                 if isMarkdownDivider(fullyTrimmed) {
                     flushProse()
-                    blocks.append(MarkdownRenderBlock(kind: .divider))
+                    appendBlock(.divider)
                     continue
                 }
 
                 if let heading = parseHeading(from: line) {
                     flushProse()
-                    blocks.append(MarkdownRenderBlock(kind: .heading(level: heading.level, text: heading.text)))
+                    appendBlock(.heading(level: heading.level, text: heading.text))
                     continue
                 }
 
                 if let ordered = parseOrderedItem(from: line) {
                     flushProse()
-                    blocks.append(MarkdownRenderBlock(kind: .ordered(number: ordered.number, text: ordered.text)))
+                    appendBlock(.ordered(number: ordered.number, text: ordered.text))
                     continue
                 }
 
                 if let unordered = parseUnorderedItem(from: line) {
                     flushProse()
-                    blocks.append(MarkdownRenderBlock(kind: .unordered(unordered)))
+                    appendBlock(.unordered(unordered))
                     continue
                 }
 
                 if let quote = parseQuote(from: line) {
                     flushProse()
-                    blocks.append(MarkdownRenderBlock(kind: .quote(quote)))
+                    appendBlock(.quote(quote))
                     continue
                 }
 
@@ -4623,7 +5559,7 @@ struct ContentView: View {
         if blocks.isEmpty {
             let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                blocks.append(MarkdownRenderBlock(kind: .paragraph(trimmed)))
+                appendBlock(.paragraph(trimmed))
             }
         }
 
@@ -4732,11 +5668,29 @@ struct ContentView: View {
     }
 
     private func markdownAttributedString(from source: String) -> AttributedString? {
+        if source.count > 2000 {
+            return nil
+        }
+
+        let markdownSignals = ["*", "_", "`", "[", "]", "~", "#", ">"]
+        if !markdownSignals.contains(where: { source.contains($0) }) {
+            return nil
+        }
+
+        let key = source as NSString
+        if let cached = Self.markdownInlineCache.object(forKey: key) {
+            return cached.attributed
+        }
+
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .full,
             failurePolicy: .returnPartiallyParsedIfPossible
         )
-        return try? AttributedString(markdown: source, options: options)
+        if let parsed = try? AttributedString(markdown: source, options: options) {
+            Self.markdownInlineCache.setObject(MarkdownInlineCacheEntry(attributed: parsed), forKey: key)
+            return parsed
+        }
+        return nil
     }
 
     @ViewBuilder
@@ -5098,6 +6052,17 @@ struct ContentView: View {
         }
     }
 
+    private func dismissComposerFocus() {
+        #if os(macOS)
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        #else
+        isComposerFocused = false
+        #endif
+        #if os(iOS)
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        #endif
+    }
+
     private var isIPhone: Bool {
         #if os(iOS)
         UIDevice.current.userInterfaceIdiom == .phone
@@ -5105,7 +6070,141 @@ struct ContentView: View {
         false
         #endif
     }
+
+    private var usesCompactSettingsLayout: Bool {
+        isIPhone
+    }
 }
+
+#if os(macOS)
+private struct MacComposerInputView: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var measuredHeight: CGFloat
+    let minHeight: CGFloat
+    let maxHeight: CGFloat
+    let onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+
+        let textView = MacComposerTextView(frame: .zero)
+        textView.delegate = context.coordinator
+        textView.onSubmit = onSubmit
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticDataDetectionEnabled = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.drawsBackground = false
+        textView.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        textView.textColor = .labelColor
+        textView.insertionPointColor = .labelColor
+        textView.string = text
+        textView.textContainerInset = NSSize(width: 0, height: 0)
+        if let textContainer = textView.textContainer {
+            textContainer.widthTracksTextView = true
+            textContainer.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+            textContainer.lineFragmentPadding = 0
+        }
+
+        scrollView.documentView = textView
+        DispatchQueue.main.async {
+            context.coordinator.recalculateHeight(for: textView)
+        }
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let textView = scrollView.documentView as? MacComposerTextView else { return }
+        textView.onSubmit = onSubmit
+        if textView.string != text {
+            textView.string = text
+        }
+        context.coordinator.recalculateHeight(for: textView)
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: MacComposerInputView
+
+        init(parent: MacComposerInputView) {
+            self.parent = parent
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            let updated = textView.string
+            if parent.text != updated {
+                parent.text = updated
+            }
+            recalculateHeight(for: textView)
+        }
+
+        func recalculateHeight(for textView: NSTextView) {
+            guard let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else {
+                return
+            }
+
+            let containerWidth = max(textView.bounds.width, 1)
+            if textContainer.containerSize.width != containerWidth {
+                textContainer.containerSize.width = containerWidth
+            }
+
+            layoutManager.ensureLayout(for: textContainer)
+            let usedHeight = ceil(layoutManager.usedRect(for: textContainer).height + textView.textContainerInset.height * 2)
+            let clamped = min(max(usedHeight, parent.minHeight), parent.maxHeight)
+            if abs(parent.measuredHeight - clamped) > 0.5 {
+                DispatchQueue.main.async {
+                    if abs(self.parent.measuredHeight - clamped) > 0.5 {
+                        self.parent.measuredHeight = clamped
+                    }
+                }
+            }
+            textView.enclosingScrollView?.hasVerticalScroller = usedHeight > parent.maxHeight + 0.5
+        }
+    }
+}
+
+private final class MacComposerTextView: NSTextView {
+    var onSubmit: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let isReturn = event.keyCode == 36 || event.keyCode == 76
+        guard isReturn else {
+            super.keyDown(with: event)
+            return
+        }
+        if hasMarkedText() {
+            super.keyDown(with: event)
+            return
+        }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.shift) {
+            super.keyDown(with: event)
+            return
+        }
+        let unsupportedFlags: NSEvent.ModifierFlags = [.command, .option, .control, .function]
+        if flags.intersection(unsupportedFlags).isEmpty {
+            onSubmit?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+#endif
 
 struct ContentView_Previews: PreviewProvider {
     static var previews: some View {
