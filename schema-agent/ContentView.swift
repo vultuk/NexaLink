@@ -83,6 +83,20 @@ struct AppServerModelOption: Identifiable, Hashable {
     let supportedReasoningEfforts: [AppServerReasoningEffortOption]
 }
 
+struct AppServerCollaborationModeOption: Identifiable, Hashable {
+    let id: String
+    let mode: String
+    let displayName: String
+    let isDefault: Bool
+    let settingsModel: String?
+}
+
+struct AppServerCollaborationModeSelection {
+    let mode: String
+    let model: String
+    let reasoningEffort: String?
+}
+
 enum AppServerConnectionState: Hashable {
     case disconnected
     case connecting
@@ -108,6 +122,7 @@ final class AppServerConnection: ObservableObject {
     @Published private(set) var isSubmittingTask = false
     @Published private(set) var taskStartSuccessCount = 0
     @Published private(set) var availableModels: [AppServerModelOption] = []
+    @Published private(set) var availableCollaborationModes: [AppServerCollaborationModeOption] = []
 
     private var connection: NWConnection?
     private let connectionQueue = DispatchQueue(label: "AppServerConnection.Socket")
@@ -151,6 +166,7 @@ final class AppServerConnection: ObservableObject {
         let prompt: String
         let model: String?
         let effort: String?
+        let collaborationMode: AppServerCollaborationModeSelection?
     }
 
     private struct PendingThreadResumeContext {
@@ -158,6 +174,7 @@ final class AppServerConnection: ObservableObject {
         let requestedThreadID: String
         let model: String?
         let effort: String?
+        let collaborationMode: AppServerCollaborationModeSelection?
     }
 
     private struct PendingTurnStartContext {
@@ -187,6 +204,7 @@ final class AppServerConnection: ObservableObject {
         activity = []
         threads = []
         availableModels = []
+        availableCollaborationModes = []
 
         connectionQueue.sync {
             self.isUserInitiatedDisconnect = false
@@ -257,6 +275,7 @@ final class AppServerConnection: ObservableObject {
 
         runningTasks = []
         availableModels = []
+        availableCollaborationModes = []
         isSubmittingTask = false
         if state != .failed {
             state = .disconnected
@@ -270,6 +289,7 @@ final class AppServerConnection: ObservableObject {
         threadID: String?,
         model: String?,
         effort: String?,
+        collaborationMode: AppServerCollaborationModeSelection? = nil,
         cwd: String? = nil
     ) -> Bool {
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -294,7 +314,8 @@ final class AppServerConnection: ObservableObject {
                     prompt: trimmedPrompt,
                     requestedThreadID: threadID,
                     model: model,
-                    effort: effort
+                    effort: effort,
+                    collaborationMode: collaborationMode
                 )
                 DispatchQueue.main.async {
                     self.statusMessage = "Resuming thread..."
@@ -309,7 +330,8 @@ final class AppServerConnection: ObservableObject {
                 self.threadStartPromptsByRequestID[requestID] = PendingThreadStartContext(
                     prompt: trimmedPrompt,
                     model: model,
-                    effort: effort
+                    effort: effort,
+                    collaborationMode: collaborationMode
                 )
                 DispatchQueue.main.async {
                     self.statusMessage = "Creating thread..."
@@ -522,6 +544,9 @@ final class AppServerConnection: ObservableObject {
                     "name": "NexaLink",
                     "title": "NexaLink",
                     "version": "0.1.0"
+                ],
+                "capabilities": [
+                    "experimentalApi": true
                 ]
             ]
         )
@@ -634,6 +659,11 @@ final class AppServerConnection: ObservableObject {
                 }
             } else if method == "model/list" {
                 modelListAccumulator.removeAll()
+            } else if method == "collaborationMode/list" {
+                DispatchQueue.main.async {
+                    self.availableCollaborationModes = []
+                }
+                shouldSkipGenericFailureStatus = true
             } else if method == "command/exec" {
                 if let completion = commandExecCompletionsByRequestID.removeValue(forKey: id) {
                     DispatchQueue.main.async {
@@ -668,6 +698,7 @@ final class AppServerConnection: ObservableObject {
             sendNotificationLocked(method: "initialized", params: [:])
             requestThreadListLocked(replace: true, cursor: nil, includeSortKey: false, includeAllSourceKinds: false)
             _ = sendRequestLocked(method: "model/list", params: ["limit": 100, "includeHidden": false])
+            _ = sendRequestLocked(method: "collaborationMode/list", params: [:])
         } else if method == "thread/start" {
             handleThreadStartResponse(id: id, payload: payload)
         } else if method == "thread/resume" {
@@ -682,6 +713,8 @@ final class AppServerConnection: ObservableObject {
             handleThreadArchiveResponse(id: id)
         } else if method == "model/list" {
             handleModelListResponse(payload: payload)
+        } else if method == "collaborationMode/list" {
+            handleCollaborationModeListResponse(payload: payload)
         } else if method == "command/exec" {
             handleCommandExecResponse(id: id, payload: payload)
         }
@@ -726,7 +759,8 @@ final class AppServerConnection: ObservableObject {
             threadID: resolvedThreadID,
             prompt: context.prompt,
             model: context.model,
-            effort: context.effort
+            effort: context.effort,
+            collaborationMode: context.collaborationMode
         )
         DispatchQueue.main.async {
             self.statusMessage = "Thread resumed. Starting task..."
@@ -773,7 +807,8 @@ final class AppServerConnection: ObservableObject {
             threadID: threadID,
             prompt: context.prompt,
             model: context.model,
-            effort: context.effort
+            effort: context.effort,
+            collaborationMode: context.collaborationMode
         )
         DispatchQueue.main.async {
             self.statusMessage = "Thread created. Starting task..."
@@ -966,6 +1001,14 @@ final class AppServerConnection: ObservableObject {
         modelListAccumulator.removeAll()
         DispatchQueue.main.async {
             self.availableModels = deduplicated
+        }
+    }
+
+    private func handleCollaborationModeListResponse(payload: [String: Any]) {
+        guard let result = payload["result"] else { return }
+        let parsedModes = parseCollaborationModeOptions(result)
+        DispatchQueue.main.async {
+            self.availableCollaborationModes = parsedModes
         }
     }
 
@@ -1299,6 +1342,28 @@ final class AppServerConnection: ObservableObject {
         return nil
     }
 
+    private func boolValue(in dictionary: [String: Any], keys: [String]) -> Bool? {
+        for key in keys {
+            if let value = dictionary[key] as? Bool {
+                return value
+            }
+            if let value = dictionary[key] as? NSNumber {
+                return value.boolValue
+            }
+            if let value = dictionary[key] as? String {
+                switch value.lowercased() {
+                case "true", "1", "yes":
+                    return true
+                case "false", "0", "no":
+                    return false
+                default:
+                    continue
+                }
+            }
+        }
+        return nil
+    }
+
     private func executeCommand(
         command: [String],
         cwd: String?,
@@ -1378,7 +1443,13 @@ final class AppServerConnection: ObservableObject {
         )
     }
 
-    private func sendTurnStartLocked(threadID: String, prompt: String, model: String?, effort: String?) {
+    private func sendTurnStartLocked(
+        threadID: String,
+        prompt: String,
+        model: String?,
+        effort: String?,
+        collaborationMode: AppServerCollaborationModeSelection?
+    ) {
         currentThreadID = threadID
         var turnParams: [String: Any] = [
             "threadId": threadID,
@@ -1394,6 +1465,18 @@ final class AppServerConnection: ObservableObject {
         }
         if let effort, !effort.isEmpty {
             turnParams["effort"] = effort
+        }
+        if let collaborationMode {
+            var settings: [String: Any] = [
+                "model": collaborationMode.model
+            ]
+            if let reasoningEffort = collaborationMode.reasoningEffort, !reasoningEffort.isEmpty {
+                settings["reasoning_effort"] = reasoningEffort
+            }
+            turnParams["collaborationMode"] = [
+                "mode": collaborationMode.mode,
+                "settings": settings
+            ]
         }
         let requestID = sendRequestLocked(method: "turn/start", params: turnParams)
         turnStartContextsByRequestID[requestID] = PendingTurnStartContext(prompt: prompt, threadID: threadID)
@@ -1461,6 +1544,118 @@ final class AppServerConnection: ObservableObject {
             return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
         }
         return deduplicated
+    }
+
+    private func parseCollaborationModeOptions(_ rawResult: Any) -> [AppServerCollaborationModeOption] {
+        var rawModeItems: [Any] = []
+        var defaultModeID: String?
+
+        func collect(from dictionary: [String: Any]) {
+            if defaultModeID == nil {
+                defaultModeID = stringValue(
+                    in: dictionary,
+                    keys: ["defaultMode", "default_mode", "default", "defaultId", "default_id"]
+                )
+            }
+
+            for key in ["data", "modes", "items", "collaborationModes", "collaboration_modes"] {
+                if let array = dictionary[key] as? [Any] {
+                    rawModeItems.append(contentsOf: array)
+                }
+            }
+
+            for key in ["result", "data", "modes", "items"] {
+                if let nested = dictionary[key] as? [String: Any] {
+                    collect(from: nested)
+                }
+            }
+        }
+
+        if let dictionary = rawResult as? [String: Any] {
+            collect(from: dictionary)
+        } else if let array = rawResult as? [Any] {
+            rawModeItems = array
+        } else if let modeString = rawResult as? String {
+            rawModeItems = [modeString]
+        }
+
+        var seenModeIDs = Set<String>()
+        var parsed: [AppServerCollaborationModeOption] = []
+
+        func modeDisplayName(for modeID: String) -> String {
+            switch modeID.lowercased() {
+            case "plan":
+                return "Plan"
+            case "default":
+                return "Default"
+            default:
+                return modeID.capitalized
+            }
+        }
+
+        for item in rawModeItems {
+            let modeID: String
+            let displayName: String
+            let isDefault: Bool
+            let settingsModel: String?
+
+            if let modeString = item as? String {
+                modeID = modeString
+                displayName = modeDisplayName(for: modeString)
+                isDefault = modeString == defaultModeID
+                settingsModel = nil
+            } else if let modeDictionary = item as? [String: Any] {
+                if let modeValue = modeDictionary["mode"] as? String {
+                    modeID = modeValue
+                } else if let modeValue = stringValue(
+                    in: modeDictionary,
+                    keys: ["id", "kind", "modeKind", "mode_kind", "name"]
+                ) {
+                    modeID = modeValue
+                } else {
+                    continue
+                }
+
+                let label = stringValue(
+                    in: modeDictionary,
+                    keys: ["displayName", "display_name", "title", "label"]
+                ) ?? modeDisplayName(for: modeID)
+                displayName = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                isDefault = boolValue(in: modeDictionary, keys: ["isDefault", "default", "is_default"]) ?? (modeID == defaultModeID)
+                if let settings = modeDictionary["settings"] as? [String: Any] {
+                    settingsModel = stringValue(in: settings, keys: ["model"])
+                } else {
+                    settingsModel = nil
+                }
+            } else {
+                continue
+            }
+
+            let normalizedID = modeID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedID.isEmpty else { continue }
+            if !seenModeIDs.insert(normalizedID).inserted {
+                continue
+            }
+
+            parsed.append(
+                AppServerCollaborationModeOption(
+                    id: normalizedID,
+                    mode: normalizedID,
+                    displayName: displayName.isEmpty ? modeDisplayName(for: normalizedID) : displayName,
+                    isDefault: isDefault,
+                    settingsModel: settingsModel
+                )
+            )
+        }
+
+        parsed.sort { lhs, rhs in
+            if lhs.isDefault != rhs.isDefault {
+                return lhs.isDefault && !rhs.isDefault
+            }
+            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+
+        return parsed
     }
 
     private func parseThread(_ raw: [String: Any]) -> AppThread? {
@@ -2724,6 +2919,19 @@ final class MultiAppServerConnectionStore: ObservableObject {
         return server.availableModels
     }
 
+    func availableCollaborationModes(for selectedMergedThreadID: String?) -> [AppServerCollaborationModeOption] {
+        targetContext(for: selectedMergedThreadID)?.server.availableCollaborationModes ?? []
+    }
+
+    func availableCollaborationModes(connectionID: String) -> [AppServerCollaborationModeOption] {
+        guard let connection = connections.first(where: { $0.id == connectionID }),
+              connection.isEnabled,
+              let server = serversByConnectionID[connectionID] else {
+            return []
+        }
+        return server.availableCollaborationModes
+    }
+
     func canStartTask(for selectedMergedThreadID: String?) -> Bool {
         guard let target = targetContext(for: selectedMergedThreadID) else { return false }
         return target.server.state == .connected && !target.server.isSubmittingTask
@@ -2821,14 +3029,16 @@ final class MultiAppServerConnectionStore: ObservableObject {
         prompt: String,
         selectedMergedThreadID: String?,
         model: String?,
-        effort: String?
+        effort: String?,
+        collaborationMode: AppServerCollaborationModeSelection?
     ) -> Bool {
         guard let target = targetContext(for: selectedMergedThreadID) else { return false }
         return target.server.startTask(
             prompt: prompt,
             threadID: target.rawThreadID,
             model: model,
-            effort: effort
+            effort: effort,
+            collaborationMode: collaborationMode
         )
     }
 
@@ -2838,7 +3048,8 @@ final class MultiAppServerConnectionStore: ObservableObject {
         connectionID: String,
         cwd: String,
         model: String?,
-        effort: String?
+        effort: String?,
+        collaborationMode: AppServerCollaborationModeSelection?
     ) -> Bool {
         guard let connection = connections.first(where: { $0.id == connectionID }),
               connection.isEnabled,
@@ -2854,6 +3065,7 @@ final class MultiAppServerConnectionStore: ObservableObject {
             threadID: nil,
             model: model,
             effort: effort,
+            collaborationMode: collaborationMode,
             cwd: trimmedCwd
         )
     }
@@ -3015,13 +3227,15 @@ final class MultiAppServerConnectionStore: ObservableObject {
         let runningTasksPublisher = server.$runningTasks.map { _ in () }.eraseToAnyPublisher()
         let submittingPublisher = server.$isSubmittingTask.map { _ in () }.eraseToAnyPublisher()
         let modelsPublisher = server.$availableModels.map { _ in () }.eraseToAnyPublisher()
+        let collaborationModesPublisher = server.$availableCollaborationModes.map { _ in () }.eraseToAnyPublisher()
 
         serverDerivedStateSubscriptions[connectionID] = Publishers.MergeMany(
             statePublisher,
             threadsPublisher,
             runningTasksPublisher,
             submittingPublisher,
-            modelsPublisher
+            modelsPublisher,
+            collaborationModesPublisher
         )
         .sink { [weak self] _ in
             guard let self else { return }
@@ -3298,6 +3512,8 @@ struct ContentView: View {
     @State private var composerMeasuredHeight: CGFloat = 0
     @State private var selectedModelOverride = ""
     @State private var selectedEffortOverride = ""
+    @State private var planModeEnabledThreadIDs: Set<String> = []
+    @State private var planModeEnabledProjectIDs: Set<String> = []
     @State private var shouldScrollConversationToBottomOnNextUpdate = true
     @State private var isConversationBottomVisible = true
     @State private var isRunningTasksExpanded = true
@@ -3390,6 +3606,16 @@ struct ContentView: View {
         return []
     }
 
+    private var activeCollaborationModeOptions: [AppServerCollaborationModeOption] {
+        if let selectedThreadID {
+            return connectionStore.availableCollaborationModes(for: selectedThreadID)
+        }
+        if let connectionID = selectedProjectConnectionID {
+            return connectionStore.availableCollaborationModes(connectionID: connectionID)
+        }
+        return []
+    }
+
     private var defaultModelOption: AppServerModelOption? {
         activeModelOptions.first(where: \.isDefault) ?? activeModelOptions.first
     }
@@ -3473,6 +3699,75 @@ struct ContentView: View {
             return "Reasoning"
         }
         return reasoningLabel(for: selectedModelOption.defaultReasoningEffort)
+    }
+
+    private var planCollaborationMode: AppServerCollaborationModeOption? {
+        activeCollaborationModeOptions.first { option in
+            option.mode.caseInsensitiveCompare("plan") == .orderedSame
+        }
+    }
+
+    private var defaultCollaborationMode: AppServerCollaborationModeOption? {
+        if let explicitDefault = activeCollaborationModeOptions.first(where: { option in
+            option.mode.caseInsensitiveCompare("default") == .orderedSame
+        }) {
+            return explicitDefault
+        }
+        if let flaggedDefault = activeCollaborationModeOptions.first(where: \.isDefault) {
+            return flaggedDefault
+        }
+        guard planCollaborationMode != nil else { return nil }
+        return AppServerCollaborationModeOption(
+            id: "default",
+            mode: "default",
+            displayName: "Default",
+            isDefault: true,
+            settingsModel: nil
+        )
+    }
+
+    private var collaborationModeModelValue: String? {
+        if let selectedModelValue {
+            return selectedModelValue
+        }
+        if let defaultModel = defaultModelOption?.model, !defaultModel.isEmpty {
+            return defaultModel
+        }
+        if let modeModel = defaultCollaborationMode?.settingsModel, !modeModel.isEmpty {
+            return modeModel
+        }
+        if let modeModel = planCollaborationMode?.settingsModel, !modeModel.isEmpty {
+            return modeModel
+        }
+        return nil
+    }
+
+    private var isPlanModeEnabledForCurrentContext: Bool {
+        if let selectedThreadID {
+            return planModeEnabledThreadIDs.contains(selectedThreadID)
+        }
+        if let selectedProjectID {
+            return planModeEnabledProjectIDs.contains(selectedProjectID)
+        }
+        return false
+    }
+
+    private var selectedCollaborationModeValue: AppServerCollaborationModeSelection? {
+        guard let model = collaborationModeModelValue else { return nil }
+        if isPlanModeEnabledForCurrentContext {
+            guard let planMode = planCollaborationMode else { return nil }
+            return AppServerCollaborationModeSelection(
+                mode: planMode.mode,
+                model: model,
+                reasoningEffort: selectedEffortValue
+            )
+        }
+        guard let defaultMode = defaultCollaborationMode else { return nil }
+        return AppServerCollaborationModeSelection(
+            mode: defaultMode.mode,
+            model: model,
+            reasoningEffort: selectedEffortValue
+        )
     }
 
     private var canStartTask: Bool {
@@ -3749,6 +4044,7 @@ struct ContentView: View {
                 }
             }
             DispatchQueue.main.async {
+                self.planModeEnabledThreadIDs.formIntersection(threadIDs)
                 refreshProjectSectionsCache()
             }
         }
@@ -3760,6 +4056,10 @@ struct ContentView: View {
                    let parsed = self.parseProjectSelectionID(selectedProjectID),
                    !validConnectionIDs.contains(parsed.connectionID) {
                     self.selectedProjectID = nil
+                }
+                self.planModeEnabledProjectIDs = self.planModeEnabledProjectIDs.filter { projectID in
+                    guard let parsed = self.parseProjectSelectionID(projectID) else { return false }
+                    return validConnectionIDs.contains(parsed.connectionID)
                 }
                 refreshProjectSectionsCache()
             }
@@ -3777,6 +4077,9 @@ struct ContentView: View {
                    let matchingThread = connectionStore.mergedThreads.first(where: { thread in
                        projectSelectionID(connectionID: thread.connectionID, projectPath: canonicalProjectPath(thread.cwd)) == selectedProjectID
                    }) {
+                    if planModeEnabledProjectIDs.contains(selectedProjectID) {
+                        planModeEnabledThreadIDs.insert(matchingThread.id)
+                    }
                     selectedThreadID = matchingThread.id
                 } else {
                     selectedThreadID = connectionStore.mergedThreads.first?.id
@@ -5104,6 +5407,22 @@ struct ContentView: View {
                 }
                 .disabled(activeModelOptions.isEmpty)
 
+                Button {
+                    togglePlanModeForCurrentContext()
+                } label: {
+                    Image(systemName: isPlanModeEnabledForCurrentContext ? "list.bullet.clipboard.fill" : "list.bullet.clipboard")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(width: 30, height: 30)
+                        .foregroundStyle(isPlanModeEnabledForCurrentContext ? Color.accentColor : Color.secondary)
+                        .background(
+                            Circle()
+                                .fill(Color.secondary.opacity(0.08))
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(planCollaborationMode == nil || collaborationModeModelValue == nil)
+                .help("Toggle plan mode")
+
                 Spacer()
 
                 if selectedThreadID != nil {
@@ -5156,7 +5475,8 @@ struct ContentView: View {
                 prompt: newTaskPrompt,
                 selectedMergedThreadID: selectedThreadID,
                 model: selectedModelValue,
-                effort: selectedEffortValue
+                effort: selectedEffortValue,
+                collaborationMode: selectedCollaborationModeValue
             )
         } else if let selectedProjectContext,
                   selectedProjectContext.projectPath != "__unknown_project__" {
@@ -5165,13 +5485,33 @@ struct ContentView: View {
                 connectionID: selectedProjectContext.connectionID,
                 cwd: selectedProjectContext.projectPath,
                 model: selectedModelValue,
-                effort: selectedEffortValue
+                effort: selectedEffortValue,
+                collaborationMode: selectedCollaborationModeValue
             )
         }
         if started {
             dismissComposerFocus()
         }
         return started
+    }
+
+    private func togglePlanModeForCurrentContext() {
+        guard planCollaborationMode != nil, collaborationModeModelValue != nil else { return }
+        if let selectedThreadID {
+            if planModeEnabledThreadIDs.contains(selectedThreadID) {
+                planModeEnabledThreadIDs.remove(selectedThreadID)
+            } else {
+                planModeEnabledThreadIDs.insert(selectedThreadID)
+            }
+            return
+        }
+
+        guard let selectedProjectID else { return }
+        if planModeEnabledProjectIDs.contains(selectedProjectID) {
+            planModeEnabledProjectIDs.remove(selectedProjectID)
+        } else {
+            planModeEnabledProjectIDs.insert(selectedProjectID)
+        }
     }
 
     private func composerChoiceLabel(_ text: String) -> some View {
