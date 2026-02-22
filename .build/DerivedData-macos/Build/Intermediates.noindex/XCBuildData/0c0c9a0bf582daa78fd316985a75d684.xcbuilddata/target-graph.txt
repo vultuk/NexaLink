@@ -1,2 +1,0 @@
-Target dependency graph (1 target)
-Target 'schema-agent' in project 'schema-agent' (no dependencies)

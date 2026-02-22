@@ -1,1 +1,27 @@
-json-schema
+# macOS
+.DS_Store
+
+# Swift Package Manager / local builds
+.build/
+.swiftpm/
+
+# Generic build output
+build/
+DerivedData/
+
+# Xcode user-specific state
+*.xcuserstate
+xcuserdata/
+
+# Workspace / project user data (generated)
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# Xcode indexing / logs
+Index.noindex/
+*.xcactivitylog
+
+# Misc generated Xcode metadata
+*.moved-aside
+*.xccheckout
+*.xcscmblueprint

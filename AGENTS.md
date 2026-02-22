@@ -86,6 +86,7 @@ It merges threads and activity across one or more remote/local websocket connect
 
 ## Networking/App-Server Rules
 - Follow schema behavior from `json-schema/` and app-server docs.
+- Agents may use files in `@json-schema` (repo folder: `json-schema/`) as a local reference for request/response shapes and protocol details.
 - For full and current app-server API behavior, consult `https://developers.openai.com/codex/app-server` as the authoritative reference.
 - Be conservative in parser changes: unknown fields should not crash parsing.
 - Support partial/incremental payloads and out-of-order events safely.
